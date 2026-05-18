@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-automation"
+version = "0.1.0"
+description = "Conservative WorldQuant BRAIN alpha exploration service"
+requires-python = ">=3.10"
+
+[project.scripts]
+alpha = "alpha.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

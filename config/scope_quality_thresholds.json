@@ -1,0 +1,413 @@
+{
+  "default_account_type": "consultant",
+  "default": {
+    "name": "official_consultant_non_chn_d1_regular",
+    "source_doc": "consultant-submission-tests",
+    "official": true,
+    "account_type": "consultant",
+    "instrumentType": "EQUITY",
+    "delay": 1,
+    "exclude_regions": ["CHN"],
+    "required_sharpe": 1.58,
+    "required_fitness": 1.0,
+    "turnover_min": 0.01,
+    "turnover_max": 0.70
+  },
+  "planning": {
+    "optimize_readiness": 0.45,
+    "setting_sweep_readiness": 0.80
+  },
+  "scopes": [
+    {
+      "name": "official_user_d1_regular",
+      "source_doc": "alpha-submission",
+      "official": true,
+      "account_type": "user",
+      "instrumentType": "EQUITY",
+      "delay": 1,
+      "exclude_regions": ["CHN"],
+      "required_sharpe": 1.25,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_formula": "0.75 * sqrt(subuniverse_size / alpha_universe_size) * alpha_sharpe"
+    },
+    {
+      "name": "official_user_d0_regular",
+      "source_doc": "alpha-submission",
+      "official": true,
+      "account_type": "user",
+      "instrumentType": "EQUITY",
+      "delay": 0,
+      "exclude_regions": ["CHN"],
+      "required_sharpe": 2.0,
+      "required_fitness": 1.3,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_formula": "0.75 * sqrt(subuniverse_size / alpha_universe_size) * alpha_sharpe"
+    },
+    {
+      "name": "official_consultant_non_chn_d1_regular",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "delay": 1,
+      "exclude_regions": ["CHN"],
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_formula": "0.75 * sqrt(subuniverse_size / alpha_universe_size) * alpha_sharpe"
+    },
+    {
+      "name": "official_consultant_non_chn_d0_regular",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "delay": 0,
+      "exclude_regions": ["CHN"],
+      "required_sharpe": 2.69,
+      "required_fitness": 1.5,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_formula": "0.75 * sqrt(subuniverse_size / alpha_universe_size) * alpha_sharpe"
+    },
+    {
+      "name": "official_usa_d1_regular_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "USA",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70
+    },
+    {
+      "name": "official_usa_d0_regular_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "USA",
+      "delay": 0,
+      "required_sharpe": 2.69,
+      "required_fitness": 1.5,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "delay1_sharpe_check": true
+    },
+    {
+      "name": "official_eur_d1_regular_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "EUR",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70
+    },
+    {
+      "name": "official_eur_d0_regular_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "EUR",
+      "delay": 0,
+      "required_sharpe": 2.69,
+      "required_fitness": 1.5,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "delay1_sharpe_check": true
+    },
+    {
+      "name": "official_glb_d1_regular_consultant",
+      "source_doc": "global-region",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "GLB",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "AMER_SHARPE": 1.0,
+        "APAC_SHARPE": 1.0,
+        "EMEA_SHARPE": 1.0
+      }
+    },
+    {
+      "name": "official_asi_d1_regular_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "ASI",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.90,
+        "INVESTABILITY_SHARPE_RATIO": 0.70
+      }
+    },
+    {
+      "name": "official_ind_d1_regular_consultant",
+      "source_doc": "getting-started-india-alphas",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "IND",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.40,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_SHARPE": 1.0
+      }
+    },
+    {
+      "name": "official_hkg_d1_regular_consultant",
+      "source_doc": "getting-started-hkgkortwn",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "HKG",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "max_trade_required": true,
+      "preferred_turnover_max": 0.30,
+      "extra_checks": {
+        "INVESTABILITY_SHARPE_RATIO": 0.70
+      }
+    },
+    {
+      "name": "official_kor_d1_regular_consultant",
+      "source_doc": "getting-started-hkgkortwn",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "KOR",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "max_trade_required": true,
+      "preferred_turnover_max": 0.30,
+      "extra_checks": {
+        "INVESTABILITY_SHARPE_RATIO": 0.70
+      }
+    },
+    {
+      "name": "official_mea_d1_regular_consultant",
+      "source_doc": "getting-started-mea-region",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "MEA",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "capacity_sensitive": true
+    },
+    {
+      "name": "official_chn_d1_regular",
+      "source_doc": "china-region-consultants",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "CHN",
+      "delay": 1,
+      "required_sharpe": 2.08,
+      "required_fitness": 1.0,
+      "required_returns": 0.08,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.40
+      }
+    },
+    {
+      "name": "official_chn_d0_regular",
+      "source_doc": "china-region-consultants",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "CHN",
+      "delay": 0,
+      "required_sharpe": 3.5,
+      "required_fitness": 1.5,
+      "required_returns": 0.12,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.40
+      }
+    },
+    {
+      "name": "official_chn_d1_regular_user",
+      "source_doc": "china-region-consultants",
+      "official": true,
+      "account_type": "user",
+      "instrumentType": "EQUITY",
+      "region": "CHN",
+      "delay": 1,
+      "required_sharpe": 2.08,
+      "required_fitness": 1.0,
+      "required_returns": 0.08,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.40
+      }
+    },
+    {
+      "name": "official_chn_d0_regular_user",
+      "source_doc": "china-region-consultants",
+      "official": true,
+      "account_type": "user",
+      "instrumentType": "EQUITY",
+      "region": "CHN",
+      "delay": 0,
+      "required_sharpe": 3.5,
+      "required_fitness": 1.5,
+      "required_returns": 0.12,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.40
+      }
+    },
+    {
+      "name": "official_usa_illiquid_minvol1m_d1_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "USA",
+      "universe": "ILLIQUID_MINVOL1M",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_ratio": 0.41,
+      "extra_checks": {
+        "MOST_ILLIQUID_50_AFTER_COST_SHARPE_FRACTION": 0.525
+      }
+    },
+    {
+      "name": "official_usa_illiquid_minvol1m_d0_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "USA",
+      "universe": "ILLIQUID_MINVOL1M",
+      "delay": 0,
+      "required_sharpe": 2.69,
+      "required_fitness": 1.5,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_ratio": 0.41,
+      "delay1_sharpe_check": true,
+      "extra_checks": {
+        "MOST_ILLIQUID_50_AFTER_COST_SHARPE_FRACTION": 0.525
+      }
+    },
+    {
+      "name": "official_eur_illiquid_minvol1m_d1_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "EUR",
+      "universe": "ILLIQUID_MINVOL1M",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_ratio": 0.355,
+      "extra_checks": {
+        "MOST_ILLIQUID_50_AFTER_COST_SHARPE_FRACTION": 0.525
+      }
+    },
+    {
+      "name": "official_eur_illiquid_minvol1m_d0_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "EUR",
+      "universe": "ILLIQUID_MINVOL1M",
+      "delay": 0,
+      "required_sharpe": 2.69,
+      "required_fitness": 1.5,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_ratio": 0.355,
+      "delay1_sharpe_check": true,
+      "extra_checks": {
+        "MOST_ILLIQUID_50_AFTER_COST_SHARPE_FRACTION": 0.525
+      }
+    },
+    {
+      "name": "official_asi_minvol1m_d1_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "ASI",
+      "universe": "MINVOL1M",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "subuniverse_ratio": 0.295,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.90,
+        "INVESTABILITY_SHARPE_RATIO": 0.70
+      }
+    },
+    {
+      "name": "official_asi_illiquid_minvol1m_d1_consultant",
+      "source_doc": "consultant-submission-tests",
+      "official": true,
+      "account_type": "consultant",
+      "instrumentType": "EQUITY",
+      "region": "ASI",
+      "universe": "ILLIQUID_MINVOL1M",
+      "delay": 1,
+      "required_sharpe": 1.58,
+      "required_fitness": 1.0,
+      "turnover_min": 0.01,
+      "turnover_max": 0.70,
+      "extra_checks": {
+        "ROBUST_UNIVERSE_RETENTION": 0.90,
+        "INVESTABILITY_SHARPE_RATIO": 0.70,
+        "MOST_ILLIQUID_50_AFTER_COST_SHARPE_FRACTION": 0.525
+      }
+    }
+  ]
+}

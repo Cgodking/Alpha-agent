@@ -1,0 +1,273 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+from .models import DEFAULT_SETTINGS
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _json(data: Any) -> str:
+    return json.dumps(data if data is not None else {}, sort_keys=True, separators=(",", ":"))
+
+
+def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+_DEDUP_SCOPE_KEYS = ("instrumentType", "region", "universe", "delay", "neutralization", "decay", "truncation")
+
+
+def _canonical_expression(expression: str) -> str:
+    return "".join(str(expression or "").split())
+
+
+def _canonical_scope(settings: Dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    merged = dict(DEFAULT_SETTINGS)
+    merged.update(settings or {})
+    return tuple((key, _canonical_scope_value(merged.get(key))) for key in _DEDUP_SCOPE_KEYS)
+
+
+def _canonical_scope_value(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            number = float(text)
+        except ValueError:
+            return text.upper()
+        return f"{number:.12g}"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.12g}"
+    return str(value if value is not None else "").strip().upper()
+
+
+class AlphaStore:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+        return conn
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self.connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def init(self) -> None:
+        with self.connection() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    expression TEXT NOT NULL,
+                    settings_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    alpha_id TEXT,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    checks_json TEXT NOT NULL DEFAULT '{}',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candidate_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS run_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_candidates_status_created_id
+                ON candidates(status, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_candidates_created_id
+                ON candidates(created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_events_candidate_id_id
+                ON events(candidate_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_events_candidate_type_id
+                ON events(candidate_id, event_type, id);
+                """
+            )
+
+    def insert_candidate(self, expression: str, settings: Dict[str, Any], source: str) -> int:
+        now = utc_now()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO candidates (
+                    expression, settings_json, source, status, metrics_json,
+                    checks_json, retry_count, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'generated', '{}', '{}', 0, ?, ?)
+                """,
+                (expression, _json(settings), source, now, now),
+            )
+            candidate_id = int(cur.lastrowid)
+        return candidate_id
+
+    def find_duplicate_candidate(self, expression: str, settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        target_expression = _canonical_expression(expression)
+        target_scope = _canonical_scope(settings)
+        for candidate in reversed(self.list_candidates()):
+            if _canonical_expression(str(candidate.get("expression") or "")) != target_expression:
+                continue
+            try:
+                candidate_settings = json.loads(str(candidate.get("settings_json") or "{}"))
+            except json.JSONDecodeError:
+                candidate_settings = {}
+            if _canonical_scope(candidate_settings if isinstance(candidate_settings, dict) else {}) == target_scope:
+                return candidate
+        return None
+
+    def get_candidate(self, candidate_id: int) -> Dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"candidate not found: {candidate_id}")
+        return _row_to_dict(row)
+
+    def list_candidates(self, status: Optional[str] = None, created_since: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.connection() as conn:
+            where = []
+            params: List[Any] = []
+            if status is not None:
+                where.append("status = ?")
+                params.append(status)
+            if created_since:
+                where.append("created_at >= ?")
+                params.append(created_since)
+            clause = f" WHERE {' AND '.join(where)}" if where else ""
+            rows = conn.execute(f"SELECT * FROM candidates{clause} ORDER BY id", params).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def list_recent_candidates(self, limit: int, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit = max(0, int(limit))
+        if limit <= 0:
+            return []
+        with self.connection() as conn:
+            if status is None:
+                rows = conn.execute(
+                    "SELECT * FROM candidates ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM candidates WHERE status = ? ORDER BY id DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def update_candidate(self, candidate_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        allowed = {"status", "alpha_id", "metrics_json", "checks_json", "retry_count"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown candidate fields: {sorted(unknown)}")
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [candidate_id]
+        with self.connection() as conn:
+            conn.execute(f"UPDATE candidates SET {assignments} WHERE id = ?", values)
+
+    def transition(self, candidate_id: int, status: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        self.update_candidate(candidate_id, status=status)
+        self.record_event(candidate_id, f"status:{status}", metadata or {})
+
+    def increment_retry(self, candidate_id: int) -> int:
+        candidate = self.get_candidate(candidate_id)
+        retry_count = int(candidate["retry_count"]) + 1
+        self.update_candidate(candidate_id, retry_count=retry_count)
+        return retry_count
+
+    def record_event(self, candidate_id: Optional[int], event_type: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO events (candidate_id, event_type, metadata_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (candidate_id, event_type, _json(metadata), utc_now()),
+            )
+
+    def events_for_candidate(self, candidate_id: Optional[int]) -> List[Dict[str, Any]]:
+        with self.connection() as conn:
+            if candidate_id is None:
+                rows = conn.execute("SELECT * FROM events WHERE candidate_id IS NULL ORDER BY id").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE candidate_id = ? ORDER BY id",
+                    (candidate_id,),
+                ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def status_counts(self, created_since: Optional[str] = None) -> Dict[str, int]:
+        with self.connection() as conn:
+            if created_since:
+                rows = conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM candidates
+                    WHERE created_at >= ?
+                    GROUP BY status
+                    ORDER BY status
+                    """,
+                    (created_since,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT status, COUNT(*) AS count FROM candidates GROUP BY status ORDER BY status").fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def set_run_state(self, key: str, value: Dict[str, Any]) -> None:
+        now = utc_now()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, _json(value), now),
+            )
+
+    def get_run_state(self, key: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self.connection() as conn:
+            row = conn.execute("SELECT value FROM run_state WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return dict(default or {})
+        try:
+            value = json.loads(str(row["value"]))
+        except json.JSONDecodeError:
+            return dict(default or {})
+        return value if isinstance(value, dict) else dict(default or {})

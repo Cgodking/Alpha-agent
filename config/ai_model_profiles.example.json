@@ -1,0 +1,37 @@
+[
+  {
+    "name": "flow",
+    "role": "controller",
+    "model": "grok-4-1-fast-reasoning",
+    "env_file": "secrets/ai/grok.env",
+    "request_timeout": 45
+  },
+  {
+    "name": "flow-critic",
+    "role": "critic",
+    "model": "deepseek-v4-pro-free",
+    "env_file": "secrets/ai/critic.env",
+    "request_timeout": 45
+  },
+  {
+    "name": "gemini",
+    "role": "generator",
+    "model": "gemini-3-flash-free",
+    "env_file": "secrets/ai/gemini.env",
+    "request_timeout": 45
+  },
+  {
+    "name": "minimax",
+    "role": "optimizer",
+    "model": "MiniMax-M2.7-free",
+    "env_file": "secrets/ai/glm.env",
+    "request_timeout": 45
+  },
+  {
+    "name": "cheap-check",
+    "role": "validator",
+    "model": "gpt-5.4-nano",
+    "env_file": "secrets/ai/nano.env",
+    "request_timeout": 30
+  }
+]

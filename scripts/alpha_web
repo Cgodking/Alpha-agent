@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${ALPHA_ROOT:-/root/Alpha}"
+SESSION_NAME="${ALPHA_WEB_SESSION:-alpha_web}"
+SERVICE_NAME="${ALPHA_WEB_SERVICE:-alpha-web.service}"
+HOST="${ALPHA_WEB_HOST:-0.0.0.0}"
+PORT="${ALPHA_WEB_PORT:-5000}"
+LOG_FILE="${ALPHA_WEB_LOG:-$ROOT_DIR/logs/web.stdout.log}"
+
+usage() {
+  printf 'usage: %s {start|stop|restart|status|logs}\n' "$0"
+}
+
+ensure_tmux() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    printf 'tmux is required for persistent web control\n' >&2
+    exit 1
+  fi
+}
+
+use_systemd() {
+  command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$SERVICE_NAME" >/dev/null 2>&1
+}
+
+is_running() {
+  tmux has-session -t "$SESSION_NAME" >/dev/null 2>&1
+}
+
+start_web() {
+  if use_systemd; then
+    systemctl start "$SERVICE_NAME"
+    systemctl --no-pager --full status "$SERVICE_NAME"
+    return 0
+  fi
+  ensure_tmux
+  mkdir -p "$(dirname "$LOG_FILE")"
+  if is_running; then
+    printf 'alpha web already running in tmux session %s\n' "$SESSION_NAME"
+    return 0
+  fi
+  local command
+  command="cd '$ROOT_DIR' && PYTHONPATH=src exec python3 -m alpha.cli --db alpha.db web --host '$HOST' --port '$PORT' >> '$LOG_FILE' 2>&1"
+  tmux new-session -d -s "$SESSION_NAME" "$command"
+  printf 'alpha web started in tmux session %s on http://%s:%s\n' "$SESSION_NAME" "$HOST" "$PORT"
+}
+
+stop_web() {
+  if use_systemd; then
+    systemctl stop "$SERVICE_NAME"
+    printf 'alpha web service stopped\n'
+    return 0
+  fi
+  ensure_tmux
+  if is_running; then
+    tmux kill-session -t "$SESSION_NAME"
+    printf 'alpha web stopped\n'
+  else
+    printf 'alpha web is not running\n'
+  fi
+}
+
+status_web() {
+  if use_systemd; then
+    systemctl --no-pager --full status "$SERVICE_NAME"
+    return 0
+  fi
+  ensure_tmux
+  if is_running; then
+    printf 'alpha web running in tmux session %s\n' "$SESSION_NAME"
+    tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid} #{pane_current_command}'
+  else
+    printf 'alpha web is not running\n'
+  fi
+}
+
+case "${1:-}" in
+  start)
+    start_web
+    ;;
+  stop)
+    stop_web
+    ;;
+  restart)
+    if use_systemd; then
+      systemctl restart "$SERVICE_NAME"
+      systemctl --no-pager --full status "$SERVICE_NAME"
+    else
+      stop_web
+      start_web
+    fi
+    ;;
+  status)
+    status_web
+    ;;
+  logs)
+    tail -n "${2:-120}" "$LOG_FILE"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
