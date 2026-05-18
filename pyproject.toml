@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alpha-automation"
 version = "0.1.0"
-description = "Conservative WorldQuant BRAIN alpha exploration service"
+description = "WorldQuant BRAIN Alpha 自动探索、回测、筛选与提交代理"
 requires-python = ">=3.10"
 
 [project.scripts]

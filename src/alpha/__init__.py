@@ -1,4 +1,4 @@
-"""Conservative WorldQuant BRAIN alpha automation service."""
+"""WorldQuant BRAIN Alpha 自动探索服务。"""
 
 __all__ = ["__version__"]
 
