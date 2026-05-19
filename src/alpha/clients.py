@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Protocol
 
-from .expression_similarity import expression_signature_metadata, expression_variant_key
+from .expression_similarity import expression_signature_metadata, expression_structure_key, expression_variant_key
 from .models import CandidateSpec, DEFAULT_SETTINGS, SimulationFailure, SimulationResult, SubmitResult
 
 
@@ -474,6 +474,9 @@ class OpenAICompatibleAIClient:
             "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism-only "
             "evidence. Do not copy their expressions or forbidden_fields; assign routes that migrate those mechanisms "
             "to fresh non-submitted primary fields. "
+            "If research_context.analysis.route_efficiency.stop_loss_active is true, stop improving the current "
+            "route locally and assign different mechanism classes. If structure_diversity_control is present, "
+            "avoid overused formula skeletons and require distinct operator geometry between profiles. "
             "If an optimizer profile is active in explore mode, treat it as the second cooperating generator, "
             "not as an allocation decision-maker."
         )
@@ -507,6 +510,8 @@ class OpenAICompatibleAIClient:
             "Flag fresh-exploration plans that ignore lit_tower_avoidance when platform pyramid evidence is present. "
             "When mechanism_transfer is present, flag plans that copy blocked expressions or forbidden_fields instead "
             "of transferring the mechanism to new primary fields. "
+            "When route_stop_loss or structure_diversity_control is present, flag plans that only swap fields inside "
+            "the same formula skeleton. "
             "Return strict JSON only: {\"concerns\":[],\"recommendations\":[],"
             "\"profile_guidance_delta\":{\"profile_name\":{\"objective\":\"...\",\"field_family\":\"...\","
             "\"mechanism\":\"...\",\"structure\":\"...\",\"avoid\":[]}},\"rationale\":\"...\"}."
@@ -545,7 +550,8 @@ class OpenAICompatibleAIClient:
             "avoidance as a hard constraint across every profile. Preserve lit_tower_avoidance as a soft diversity "
             "constraint: choose unlit pyramid towers for fresh exploration whenever possible. If mechanism_transfer "
             "is active, keep it mechanism only: Do not copy blocked fields or expressions, and route profiles toward "
-            "fresh primary fields that preserve the historical signal logic."
+            "fresh primary fields that preserve the historical signal logic. Preserve route_stop_loss and "
+            "structure_diversity_control by forcing different mechanism classes and formula skeletons."
         )
         user = json.dumps(
             {
@@ -579,6 +585,8 @@ class OpenAICompatibleAIClient:
             "Also flag fresh candidates that ignore lit_tower_avoidance when the final plan chose unlit pyramid routes. "
             "When final_plan.mechanism_transfer is present, reject candidates that copy mechanism_transfer "
             "forbidden_fields as primary fields instead of transferring the mechanism. "
+            "When final_plan.structure_diversity_control is present, reject candidates that refill the batch with "
+            "more copies of an already accepted formula skeleton. "
             "Return strict JSON only: {\"concerns\":[],\"recommendations\":[],"
             "\"profile_guidance_delta\":{\"profile_name\":{\"objective\":\"...\",\"field_family\":\"...\","
             "\"mechanism\":\"...\",\"structure\":\"...\",\"avoid\":[]}},\"rationale\":\"...\"}."
@@ -621,6 +629,8 @@ class OpenAICompatibleAIClient:
             "When replacement candidates are needed, preserve submitted-field constraints and lit_tower_avoidance. "
             "If mechanism_transfer is present, use it only for mechanism transfer and never for copying its "
             "forbidden_fields or exact expressions. "
+            "If structure_diversity_control is present, replacement candidates must use a different formula skeleton "
+            "from the accepted batch where possible. "
             "Return strict JSON only: {\"action\":\"accept|refill|repair|abandon\","
             "\"allocation\":{\"profile_name\":1},\"profile_guidance\":{\"profile_name\":{\"objective\":\"...\","
             "\"field_family\":\"...\",\"mechanism\":\"...\",\"structure\":\"...\",\"avoid\":[]}},"
@@ -777,6 +787,9 @@ class OpenAICompatibleAIClient:
             "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism only "
             "examples. Do not copy their expressions. Do not copy forbidden_fields into primary alpha legs. Transfer "
             "the mechanism to fresh, allowed, non-submitted fields while keeping auxiliary fields only as helpers. "
+            "If research_context.experiment_plan.route_stop_loss is active, do not keep optimizing the same route; "
+            "change mechanism class and operator geometry. If structure_diversity_control is present, generate no "
+            "more than its max_batch_candidates_per_structure candidates per field-agnostic formula skeleton. "
             "If research_context.profile_guidance is present, treat it as mandatory model-specific "
             "direction and generate candidates only within that assigned route. "
                         "Treat research_context.syntax_constraints as hard syntax policy: use only its "
@@ -827,6 +840,8 @@ class OpenAICompatibleAIClient:
                                 ),
                                 "avoid_near_duplicates_from_recent_history": True,
                                 "avoid_recent_approved_submitted_fields": True,
+                                "respect_route_stop_loss": True,
+                                "respect_structure_diversity_control": True,
                             },
                         },
                         sort_keys=True,
@@ -1727,8 +1742,10 @@ class MultiModelAIClient:
         reject_structural_duplicates = bool(
             isinstance(generation_policy, dict) and generation_policy.get("avoid_structural_duplicates")
         )
+        max_per_structure = _max_batch_candidates_per_structure(context)
         seen = set()
         seen_structures = set()
+        structure_counts: Dict[str, int] = {}
         deduped: List[CandidateSpec] = []
         for candidate in candidates:
             key = re.sub(r"\s+", "", candidate.expression.lower())
@@ -1737,8 +1754,12 @@ class MultiModelAIClient:
             variant_key = expression_variant_key(candidate.expression)
             if reject_structural_duplicates and variant_key in seen_structures:
                 continue
+            structure_key = expression_structure_key(candidate.expression)
+            if max_per_structure > 0 and int(structure_counts.get(structure_key, 0)) >= max_per_structure:
+                continue
             seen.add(key)
             seen_structures.add(variant_key)
+            structure_counts[structure_key] = int(structure_counts.get(structure_key, 0)) + 1
             deduped.append(candidate)
         return deduped
 
@@ -2033,6 +2054,8 @@ def _compact_controller_analysis(analysis: Dict[str, Any]) -> Dict[str, Any]:
         "family_diversity_control",
         "submitted_avoid_fields",
         "lit_tower_avoidance",
+        "route_efficiency",
+        "structure_diversity_control",
         "observed_quality_thresholds",
         "optimization_state",
     ):
@@ -2224,6 +2247,32 @@ def _is_split_retryable_generation_error(exc: Exception) -> bool:
         "request too large",
     )
     return any(marker in message for marker in retryable_markers)
+
+
+def _max_batch_candidates_per_structure(context: Dict[str, Any] | None) -> int:
+    research_context = dict(context or {}).get("research_context")
+    if not isinstance(research_context, dict):
+        return 0
+    experiment_plan = research_context.get("experiment_plan") if isinstance(research_context.get("experiment_plan"), dict) else {}
+    mode = str(experiment_plan.get("mode") or "").lower()
+    if mode in {"optimize_best", "setting_sweep", "repair"}:
+        return 0
+    control = (
+        experiment_plan.get("structure_diversity_control")
+        if isinstance(experiment_plan.get("structure_diversity_control"), dict)
+        else {}
+    )
+    raw = control.get("max_batch_candidates_per_structure")
+    generation_policy = (
+        research_context.get("generation_policy") if isinstance(research_context.get("generation_policy"), dict) else {}
+    )
+    if raw in (None, ""):
+        raw = generation_policy.get("max_batch_candidates_per_structure")
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
 
 
 def _client_profile_dict(client: Any) -> Dict[str, Any]:

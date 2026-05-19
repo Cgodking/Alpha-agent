@@ -705,6 +705,45 @@ class MultiModelTests(unittest.TestCase):
 
         self.assertEqual(len(candidates), 2)
 
+    def test_multi_model_client_caps_same_structure_when_policy_requests_it(self):
+        class SameStructureGenerator:
+            profile_name = "G-1"
+            model = "gemini-3-flash-free"
+            role = "generator"
+
+            def generate_candidates(self, batch_size, context):
+                settings = {"region": "MEA", "delay": 1}
+                return [
+                    CandidateSpec(
+                        f"group_rank(pasteurize(normalize(quantile(fresh_signal_{idx}))),industry)",
+                        settings=settings,
+                        source="model:G-1",
+                    )
+                    for idx in range(batch_size)
+                ]
+
+        client = MultiModelAIClient(generators=[SameStructureGenerator()])
+
+        candidates = client.generate_candidates(
+            4,
+            {
+                "region": "MEA",
+                "delay": 1,
+                "research_context": {
+                    "generation_policy": {
+                        "avoid_structural_duplicates": True,
+                        "max_batch_candidates_per_structure": 2,
+                    },
+                    "experiment_plan": {
+                        "mode": "explore_new_family",
+                        "structure_diversity_control": {"max_batch_candidates_per_structure": 2},
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(len(candidates), 2)
+
     def test_multi_model_client_does_not_split_retry_nonrecoverable_model_errors(self):
         controller = FakeController({"mode": "explore", "allocation": {"minimax": 4}})
         minimax = FailingGenerator(

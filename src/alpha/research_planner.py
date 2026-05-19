@@ -8,6 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from .expression_similarity import expression_structure_key
 from .preflight import ALLOWED_OPERATORS
 from .scopes import PLATFORM_SCOPE_OPTIONS
 
@@ -26,6 +27,10 @@ DEFAULT_SETTING_SWEEP_READINESS = 0.80
 QUALITY_COMPONENT_CAP = 1.2
 SCOPE_TROUBLE_FAILURE_STREAK = 96
 SCOPE_TROUBLE_MIN_SCANNED = 120
+ROUTE_STOP_LOSS_MIN_SCANNED = 120
+ROUTE_STOP_LOSS_FAILURE_STREAK = 80
+ROUTE_STOP_LOSS_SHARPE_RATIO = 0.85
+MAX_BATCH_CANDIDATES_PER_STRUCTURE = 2
 CHECK_PENALTIES = {
     "HIGH_TURNOVER": 0.85,
     "LOW_TURNOVER": 0.45,
@@ -168,6 +173,14 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
     history_memory = research_context.get("history_memory") if isinstance(research_context.get("history_memory"), dict) else {}
     mechanism_memory = _mechanism_memory_from_history(history_memory)
     scope_health = history_memory.get("scope_health") if isinstance(history_memory.get("scope_health"), dict) else {}
+    candidate_queue_counts = _candidate_queue_counts(research_context)
+    quality_thresholds = _quality_thresholds(
+        best or {},
+        target_settings,
+        {"observed_quality_thresholds": observed_quality_thresholds},
+    )
+    route_efficiency = _route_efficiency(scope_health, candidate_queue_counts, quality_thresholds)
+    structure_diversity_control = _structure_diversity_control(candidates, history_memory)
 
     submitted_avoid_fields = _submitted_avoid_fields(research_context)
     promising_fields = [
@@ -191,7 +204,7 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
     return {
         "candidate_count": len(candidates),
         "best_candidate": best or {},
-        "candidate_queue_counts": _candidate_queue_counts(research_context),
+        "candidate_queue_counts": candidate_queue_counts,
         "failure_reasons": dict(failure_reasons.most_common(12)),
         "promising_fields": promising_fields,
         "weak_fields": weak_fields,
@@ -203,6 +216,8 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
         "lit_tower_avoidance": lit_tower_avoidance,
         "mechanism_memory": mechanism_memory,
         "scope_health": scope_health,
+        "route_efficiency": route_efficiency,
+        "structure_diversity_control": structure_diversity_control,
         "observed_quality_thresholds": observed_quality_thresholds,
         "optimization_state": optimization_state,
     }
@@ -228,6 +243,10 @@ def build_experiment_plan(
     family_diversity_control = (
         analysis.get("family_diversity_control") if isinstance(analysis.get("family_diversity_control"), dict) else {}
     )
+    route_stop_loss = analysis.get("route_efficiency") if isinstance(analysis.get("route_efficiency"), dict) else {}
+    structure_diversity_control = (
+        analysis.get("structure_diversity_control") if isinstance(analysis.get("structure_diversity_control"), dict) else {}
+    )
     optimization_state = analysis.get("optimization_state") if isinstance(analysis.get("optimization_state"), dict) else {}
     sharpe = _float(best.get("sharpe"))
     fitness = _float(best.get("fitness"))
@@ -252,6 +271,8 @@ def build_experiment_plan(
                 + _family_diversity_objective(family_diversity_control)
                 + _submitted_avoidance_objective(submitted_avoidance)
                 + _lit_tower_objective(lit_tower_avoidance)
+                + _route_stop_loss_objective(route_stop_loss)
+                + _structure_diversity_objective(structure_diversity_control)
             ),
             "keep": [],
             "change": [
@@ -259,6 +280,7 @@ def build_experiment_plan(
                 "avoid exact expressions and forbidden fields from mechanism_transfer",
                 "prefer smoother turnover-aware structures",
                 "split profiles across different transferable mechanisms",
+                "replace overused formula skeletons",
             ],
             "avoid": _avoid_list(
                 failure_reasons,
@@ -269,6 +291,8 @@ def build_experiment_plan(
             "lit_tower_avoidance": lit_tower_avoidance,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
+            "route_stop_loss": route_stop_loss,
+            "structure_diversity_control": structure_diversity_control,
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
@@ -286,18 +310,23 @@ def build_experiment_plan(
                 "Abandon that family and explore structurally different fields."
                 + _submitted_avoidance_objective(submitted_avoidance)
                 + _lit_tower_objective(lit_tower_avoidance)
+                + _route_stop_loss_objective(route_stop_loss)
+                + _structure_diversity_objective(structure_diversity_control)
             ),
             "keep": [],
             "change": [
                 "switch field family",
                 "avoid local variants of the abandoned expression",
                 "test simpler field-native mechanisms",
+                "replace overused formula skeletons",
             ],
             "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields + list(best.get("fields") or [])),
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
+            "route_stop_loss": route_stop_loss,
+            "structure_diversity_control": structure_diversity_control,
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
@@ -336,6 +365,8 @@ def build_experiment_plan(
             "lit_tower_avoidance": lit_tower_avoidance,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
+            "route_stop_loss": route_stop_loss,
+            "structure_diversity_control": structure_diversity_control,
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
@@ -391,6 +422,8 @@ def build_experiment_plan(
             "lit_tower_avoidance": lit_tower_avoidance,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
+            "route_stop_loss": route_stop_loss,
+            "structure_diversity_control": structure_diversity_control,
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
@@ -414,6 +447,8 @@ def build_experiment_plan(
                 + _family_diversity_objective(family_diversity_control)
                 + _submitted_avoidance_objective(submitted_avoidance)
                 + _lit_tower_objective(lit_tower_avoidance)
+                + _route_stop_loss_objective(route_stop_loss)
+                + _structure_diversity_objective(structure_diversity_control)
             ),
             "keep": _diversified_keep_fields(
                 best,
@@ -426,6 +461,7 @@ def build_experiment_plan(
                 "switch field family",
                 "test simpler field-native mechanisms",
                 "use one clear economic hypothesis per candidate",
+                "replace overused formula skeletons",
             ],
             "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields),
             "family_diversity_control": family_diversity_control,
@@ -433,6 +469,8 @@ def build_experiment_plan(
             "lit_tower_avoidance": lit_tower_avoidance,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
+            "route_stop_loss": route_stop_loss,
+            "structure_diversity_control": structure_diversity_control,
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
@@ -445,6 +483,7 @@ def build_experiment_plan(
         "objective": (
             "No usable local evidence yet. Generate diverse research-grade candidates from verified fields."
             + _lit_tower_objective(lit_tower_avoidance)
+            + _structure_diversity_objective(structure_diversity_control)
         ),
         "keep": [],
         "change": ["cover multiple field families", "use economically grounded windows", "avoid trivial price-volume ranks"],
@@ -457,6 +496,8 @@ def build_experiment_plan(
         "lit_tower_avoidance": lit_tower_avoidance,
         "scope_trouble": scope_trouble,
         "mechanism_transfer": mechanism_transfer,
+        "route_stop_loss": route_stop_loss,
+        "structure_diversity_control": structure_diversity_control,
         "batch_size": int(batch_size),
         "target_settings": dict(target_settings),
         "quality_thresholds": quality_thresholds,
@@ -1447,6 +1488,107 @@ def _mechanism_memory_from_history(history_memory: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def _route_efficiency(
+    scope_health: Dict[str, Any],
+    queue_counts: Dict[str, Any],
+    quality_thresholds: Dict[str, Any],
+) -> Dict[str, Any]:
+    signals = scope_health.get("trouble_signals") if isinstance(scope_health.get("trouble_signals"), dict) else {}
+    scanned = int(_float(signals.get("scanned_candidates")))
+    failure_streak = int(_float(signals.get("failure_streak")))
+    watchlist_count = int(_float(queue_counts.get("watchlist")))
+    submitable_count = int(_float(queue_counts.get("submitable")))
+    optimize_count = int(_float(queue_counts.get("optimize")))
+    best_recent_sharpe = _float(scope_health.get("best_recent_sharpe"))
+    best_recent_fitness = _float(scope_health.get("best_recent_fitness"))
+    best_recent_quality_score = _float(scope_health.get("best_recent_quality_score"))
+    required_sharpe = _positive_float(quality_thresholds.get("required_sharpe"))
+    required_fitness = _positive_float(quality_thresholds.get("required_fitness"))
+    sharpe_ratio = _positive_ratio(best_recent_sharpe, required_sharpe) if required_sharpe else 0.0
+    fitness_ratio = _positive_ratio(best_recent_fitness, required_fitness) if required_fitness else 0.0
+    strong_progress = submitable_count + watchlist_count
+    stop_loss_active = (
+        scanned >= ROUTE_STOP_LOSS_MIN_SCANNED
+        and failure_streak >= ROUTE_STOP_LOSS_FAILURE_STREAK
+        and strong_progress == 0
+        and sharpe_ratio < ROUTE_STOP_LOSS_SHARPE_RATIO
+    )
+    return {
+        "active": bool(stop_loss_active),
+        "stop_loss_active": bool(stop_loss_active),
+        "reason": "NO_WATCHLIST_OR_SUBMITABLE_PROGRESS" if stop_loss_active else "",
+        "scanned_candidates": scanned,
+        "failure_streak": failure_streak,
+        "submitable_count": submitable_count,
+        "watchlist_count": watchlist_count,
+        "optimize_count": optimize_count,
+        "best_recent_sharpe": best_recent_sharpe,
+        "best_recent_fitness": best_recent_fitness,
+        "best_recent_quality_score": best_recent_quality_score,
+        "required_sharpe": required_sharpe,
+        "required_fitness": required_fitness,
+        "best_sharpe_ratio": round(sharpe_ratio, 4),
+        "best_fitness_ratio": round(fitness_ratio, 4),
+        "policy": (
+            "If active, stop spending full rounds on local variants of this route. Switch mechanism and cap repeated "
+            "formula skeletons until a candidate reaches watchlist or submitable quality."
+        ),
+    }
+
+
+def _structure_diversity_control(candidates: List[Dict[str, Any]], history_memory: Dict[str, Any]) -> Dict[str, Any]:
+    top_structures = history_memory.get("top_structures") if isinstance(history_memory.get("top_structures"), list) else []
+    overused: List[Dict[str, Any]] = []
+    for item in top_structures:
+        if not isinstance(item, dict):
+            continue
+        count = int(_float(item.get("count")))
+        failed = int(_float(item.get("failed")))
+        failure_rate = _float(item.get("failure_rate"))
+        best_quality = _float(item.get("best_quality_score"))
+        if count >= 6 and failed >= 4 and failure_rate >= 0.65 and best_quality < 0.45:
+            overused.append(
+                {
+                    "structure_key": item.get("structure_key"),
+                    "count": count,
+                    "failed": failed,
+                    "failure_rate": round(failure_rate, 4),
+                    "best_sharpe": item.get("best_sharpe"),
+                    "best_fitness": item.get("best_fitness"),
+                    "best_quality_score": item.get("best_quality_score"),
+                    "example_expression": item.get("example_expression"),
+                }
+            )
+    if not overused:
+        counts: Counter[str] = Counter()
+        examples: Dict[str, str] = {}
+        for candidate in candidates:
+            expression = str(candidate.get("expression") or "")
+            key = expression_structure_key(expression)
+            counts[key] += 1
+            examples.setdefault(key, expression)
+        for key, count in counts.most_common(6):
+            if count >= 3:
+                overused.append(
+                    {
+                        "structure_key": key,
+                        "count": count,
+                        "failed": count,
+                        "failure_rate": 1.0,
+                        "example_expression": examples.get(key),
+                    }
+                )
+    return {
+        "active": bool(overused),
+        "max_batch_candidates_per_structure": MAX_BATCH_CANDIDATES_PER_STRUCTURE,
+        "overused_structures": overused[:8],
+        "policy": (
+            "During exploration, cap same-round candidates with the same field-agnostic formula skeleton. "
+            "Use different operator geometry, not only different fields or windows."
+        ),
+    }
+
+
 def _scope_trouble_state(analysis: Dict[str, Any], quality_thresholds: Dict[str, Any]) -> Dict[str, Any]:
     health = analysis.get("scope_health") if isinstance(analysis.get("scope_health"), dict) else {}
     signals = health.get("trouble_signals") if isinstance(health.get("trouble_signals"), dict) else {}
@@ -1513,6 +1655,36 @@ def _mechanism_transfer_objective(mechanism_transfer: Dict[str, Any]) -> str:
     tag_note = f" Transfer mechanisms: {', '.join(tags[:6])}." if tags else ""
     forbidden_note = f" Do not copy forbidden fields: {', '.join(forbidden[:8])}." if forbidden else ""
     return tag_note + forbidden_note
+
+
+def _route_stop_loss_objective(route_stop_loss: Dict[str, Any]) -> str:
+    if not route_stop_loss or not route_stop_loss.get("stop_loss_active"):
+        return ""
+    return (
+        " Route stop-loss is active: recent scoped exploration produced no submitable/watchlist progress. "
+        "Do not keep local variants of the same route; switch mechanism class and require visibly different "
+        "operator geometry."
+    )
+
+
+def _structure_diversity_objective(structure_diversity: Dict[str, Any]) -> str:
+    if not structure_diversity:
+        return ""
+    max_per = int(_float(structure_diversity.get("max_batch_candidates_per_structure")))
+    overused = structure_diversity.get("overused_structures")
+    if not isinstance(overused, list):
+        overused = []
+    cap_note = (
+        f" Same-round exploration is capped at {max_per} candidates per formula skeleton."
+        if max_per > 0
+        else ""
+    )
+    overused_note = (
+        " Avoid recently overused weak formula skeletons; change the operator geometry, not just fields/windows."
+        if overused
+        else ""
+    )
+    return cap_note + overused_note
 
 
 def _lit_tower_objective(lit_tower_avoidance: Dict[str, Any]) -> str:

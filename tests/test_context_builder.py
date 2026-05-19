@@ -1239,6 +1239,93 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertNotIn("investabilityConstrained", queues["optimize"][0]["metrics"])
         self.assertEqual(queues["watchlist"][0]["queue_reason"], "terminal_checks_waiting")
 
+    def test_build_ai_research_context_adds_route_stop_loss_for_stagnant_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            settings = {"region": "MEA", "universe": "TOP300", "delay": 1, "neutralization": "MARKET"}
+            for idx in range(140):
+                candidate_id = store.insert_candidate(
+                    f"group_rank(pasteurize(normalize(quantile(stale_signal_{idx}))),industry)",
+                    settings,
+                    "model:G-1" if idx % 2 == 0 else "model:G-2",
+                )
+                store.update_candidate(
+                    candidate_id,
+                    metrics_json=json.dumps({"sharpe": 0.05 + (idx % 5) * 0.01, "fitness": 0.02, "turnover": 0.2}),
+                    checks_json=json.dumps(
+                        {
+                            "LOW_SHARPE": {"status": "FAIL", "value": 0.08, "limit": 1.58},
+                            "LOW_FITNESS": {"status": "FAIL", "value": 0.02, "limit": 1.0},
+                            "LOW_2Y_SHARPE": {"status": "FAIL", "value": 0.04, "limit": 1.58},
+                        }
+                    ),
+                )
+                store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL", "LOW_FITNESS:FAIL"]})
+
+            context = build_ai_research_context(
+                store,
+                settings,
+                knowledge_dir=base / "missing-knowledge",
+                reference_dir=base / "missing-reference",
+                field_catalog={"available": True, "field_ids": [f"stale_signal_{idx}" for idx in range(140)], "fields": []},
+            )
+
+        route = context["analysis"]["route_efficiency"]
+        plan = context["experiment_plan"]
+        self.assertTrue(route["stop_loss_active"])
+        self.assertGreaterEqual(route["scanned_candidates"], 120)
+        self.assertEqual(route["watchlist_count"], 0)
+        self.assertEqual(plan["route_stop_loss"]["active"], True)
+        self.assertEqual(plan["structure_diversity_control"]["max_batch_candidates_per_structure"], 2)
+        self.assertTrue(plan["structure_diversity_control"]["overused_structures"])
+        self.assertIn("replace overused formula skeletons", plan["change"])
+
+    def test_build_ai_research_context_does_not_stop_loss_when_watchlist_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            settings = {"region": "MEA", "universe": "TOP300", "delay": 1, "neutralization": "MARKET"}
+            for idx in range(120):
+                candidate_id = store.insert_candidate(
+                    f"group_rank(pasteurize(normalize(quantile(weak_signal_{idx}))),industry)",
+                    settings,
+                    "model:G-1",
+                )
+                store.update_candidate(candidate_id, metrics_json=json.dumps({"sharpe": 0.05, "fitness": 0.02}))
+                store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+            watch_id = store.insert_candidate(
+                "group_rank(ts_rank(ts_backfill(wait_signal,120),63),industry)",
+                settings,
+                "model:G-2",
+            )
+            store.update_candidate(
+                watch_id,
+                metrics_json=json.dumps({"sharpe": 1.7, "fitness": 1.1, "turnover": 0.2}),
+                checks_json=json.dumps(
+                    {
+                        "LOW_SHARPE": {"status": "PASS", "value": 1.7, "limit": 1.58},
+                        "LOW_FITNESS": {"status": "PASS", "value": 1.1, "limit": 1.0},
+                        "SELF_CORRELATION": {"status": "PENDING"},
+                        "PROD_CORRELATION": {"status": "PENDING"},
+                    }
+                ),
+            )
+            store.transition(watch_id, "check_pending", {"errors": ["SELF_CORRELATION:PENDING"]})
+
+            context = build_ai_research_context(
+                store,
+                settings,
+                knowledge_dir=base / "missing-knowledge",
+                reference_dir=base / "missing-reference",
+            )
+
+        route = context["analysis"]["route_efficiency"]
+        self.assertEqual(route["watchlist_count"], 1)
+        self.assertFalse(route["stop_loss_active"])
+
 
 if __name__ == "__main__":
     unittest.main()

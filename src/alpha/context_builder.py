@@ -79,6 +79,7 @@ def build_ai_research_context(
             "avoid_trivial_price_volume_only": True,
             "avoid_structural_duplicates": True,
             "avoid_historical_structural_duplicates": True,
+            "max_batch_candidates_per_structure": 2,
             "avoid_recent_submitted_fields": True,
             "avoid_lit_pyramid_towers": True,
             "auxiliary_fields_must_not_be_primary": True,
@@ -868,6 +869,7 @@ def _history_memory(
     failure_reasons: Dict[str, int] = {}
     field_stats: Dict[str, Dict[str, Any]] = {}
     family_stats: Dict[str, Dict[str, Any]] = {}
+    structure_stats: Dict[str, Dict[str, Any]] = {}
     profile_outcomes: Dict[str, Dict[str, int]] = {}
     blocked_winner_archetypes: List[Dict[str, Any]] = []
     scanned = 0
@@ -908,6 +910,7 @@ def _history_memory(
             }
         )
         expression = str(candidate.get("expression") or "")
+        structure_key = expression_structure_key(expression)
         fields = _extract_fields(expression, known_fields)
         profile = _profile_from_source(candidate.get("source")) or "unknown"
         best_recent_sharpe = _max_number(best_recent_sharpe, metrics.get("sharpe") if isinstance(metrics, dict) else None)
@@ -929,6 +932,12 @@ def _history_memory(
             _update_memory_bucket(field_stats.setdefault(field, _new_memory_bucket(field)), status, metrics, quality)
             family = _submission_field_family(field)
             _update_memory_bucket(family_stats.setdefault(family, _new_memory_bucket(family)), status, metrics, quality)
+        _update_structure_bucket(
+            structure_stats.setdefault(structure_key, _new_structure_bucket(structure_key, expression)),
+            status,
+            metrics,
+            quality,
+        )
 
         archetype = _blocked_winner_archetype(
             store,
@@ -956,6 +965,7 @@ def _history_memory(
         "status_counts": status_counts,
         "top_fields": _top_memory_buckets(field_stats, 30),
         "top_field_families": _top_memory_buckets(family_stats, 20),
+        "top_structures": _top_structure_buckets(structure_stats, 20),
         "top_failure_reasons": [
             {"reason": reason, "count": count}
             for reason, count in sorted(failure_reasons.items(), key=lambda item: (-item[1], item[0]))[:20]
@@ -1148,6 +1158,23 @@ def _new_memory_bucket(name: str) -> Dict[str, Any]:
     }
 
 
+def _new_structure_bucket(key: str, expression: str) -> Dict[str, Any]:
+    return {
+        "structure_key": key,
+        "example_expression": _compact_text(expression, 180),
+        "count": 0,
+        "approved": 0,
+        "submitted": 0,
+        "check_pending": 0,
+        "failed": 0,
+        "best_sharpe": None,
+        "best_fitness": None,
+        "best_quality_score": None,
+        "total_sharpe": 0.0,
+        "sharpe_count": 0,
+    }
+
+
 def _update_memory_bucket(
     bucket: Dict[str, Any],
     status: str,
@@ -1158,6 +1185,25 @@ def _update_memory_bucket(
     if status in {"approved", "submitted", "check_pending", "failed"}:
         bucket[status] = int(bucket.get(status) or 0) + 1
     if isinstance(metrics, dict):
+        _update_best_number(bucket, "best_sharpe", metrics.get("sharpe"))
+        _update_best_number(bucket, "best_fitness", metrics.get("fitness"))
+    _update_best_number(bucket, "best_quality_score", quality.get("quality_score"))
+
+
+def _update_structure_bucket(
+    bucket: Dict[str, Any],
+    status: str,
+    metrics: Any,
+    quality: Dict[str, Any],
+) -> None:
+    bucket["count"] = int(bucket.get("count") or 0) + 1
+    if status in {"approved", "submitted", "check_pending", "failed"}:
+        bucket[status] = int(bucket.get(status) or 0) + 1
+    if isinstance(metrics, dict):
+        sharpe = _float_or_none(metrics.get("sharpe"))
+        if sharpe is not None:
+            bucket["total_sharpe"] = float(bucket.get("total_sharpe") or 0.0) + sharpe
+            bucket["sharpe_count"] = int(bucket.get("sharpe_count") or 0) + 1
         _update_best_number(bucket, "best_sharpe", metrics.get("sharpe"))
         _update_best_number(bucket, "best_fitness", metrics.get("fitness"))
     _update_best_number(bucket, "best_quality_score", quality.get("quality_score"))
@@ -1188,6 +1234,44 @@ def _top_memory_buckets(buckets: Dict[str, Dict[str, Any]], limit: int) -> List[
         row["field"] = row.pop("name")
         compact_rows.append({key: value for key, value in row.items() if value is not None})
     return compact_rows
+
+
+def _top_structure_buckets(buckets: Dict[str, Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for bucket in buckets.values():
+        count = int(bucket.get("count") or 0)
+        sharpe_count = int(bucket.get("sharpe_count") or 0)
+        avg_sharpe = (float(bucket.get("total_sharpe") or 0.0) / sharpe_count) if sharpe_count else None
+        rows.append(
+            {
+                "structure_key": bucket.get("structure_key"),
+                "example_expression": bucket.get("example_expression"),
+                "count": count,
+                "failed": int(bucket.get("failed") or 0),
+                "approved": int(bucket.get("approved") or 0),
+                "submitted": int(bucket.get("submitted") or 0),
+                "check_pending": int(bucket.get("check_pending") or 0),
+                "best_sharpe": bucket.get("best_sharpe"),
+                "best_fitness": bucket.get("best_fitness"),
+                "best_quality_score": bucket.get("best_quality_score"),
+                "avg_sharpe": round(avg_sharpe, 6) if avg_sharpe is not None else None,
+                "failure_rate": round((int(bucket.get("failed") or 0) / count), 6) if count else None,
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            int(item.get("count") or 0),
+            int(item.get("failed") or 0),
+            _float_or_none(item.get("best_quality_score")) or -999.0,
+        ),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
+def _compact_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
 
 
 def _failure_reason_names(store: AlphaStore, candidate_id: int, quality: Dict[str, Any]) -> List[str]:
