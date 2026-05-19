@@ -106,6 +106,33 @@ class AlphaStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS archived_candidates (
+                    original_candidate_id INTEGER PRIMARY KEY,
+                    expression TEXT NOT NULL,
+                    settings_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    alpha_id TEXT,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    checks_json TEXT NOT NULL DEFAULT '{}',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL,
+                    prune_reason TEXT NOT NULL,
+                    archive_metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS archived_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_event_id INTEGER NOT NULL UNIQUE,
+                    candidate_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_candidates_status_created_id
                 ON candidates(status, created_at, id);
 
@@ -117,6 +144,12 @@ class AlphaStore:
 
                 CREATE INDEX IF NOT EXISTS idx_events_candidate_type_id
                 ON events(candidate_id, event_type, id);
+
+                CREATE INDEX IF NOT EXISTS idx_archived_candidates_scope
+                ON archived_candidates(original_candidate_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_archived_events_candidate_id
+                ON archived_events(candidate_id, original_event_id);
                 """
             )
 
@@ -148,6 +181,31 @@ class AlphaStore:
                 candidate_settings = {}
             if _canonical_scope(candidate_settings if isinstance(candidate_settings, dict) else {}) == target_scope:
                 return candidate
+        archived = self._find_archived_duplicate_candidate(target_expression, target_scope)
+        if archived is not None:
+            return archived
+        return None
+
+    def _find_archived_duplicate_candidate(
+        self,
+        target_expression: str,
+        target_scope: tuple[tuple[str, str], ...],
+    ) -> Optional[Dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT * FROM archived_candidates ORDER BY original_candidate_id DESC").fetchall()
+        for row in rows:
+            candidate = _row_to_dict(row)
+            if _canonical_expression(str(candidate.get("expression") or "")) != target_expression:
+                continue
+            try:
+                candidate_settings = json.loads(str(candidate.get("settings_json") or "{}"))
+            except json.JSONDecodeError:
+                candidate_settings = {}
+            if _canonical_scope(candidate_settings if isinstance(candidate_settings, dict) else {}) != target_scope:
+                continue
+            candidate["id"] = int(candidate["original_candidate_id"])
+            candidate["archived"] = True
+            return candidate
         return None
 
     def get_candidate(self, candidate_id: int) -> Dict[str, Any]:
@@ -231,6 +289,90 @@ class AlphaStore:
                     (candidate_id,),
                 ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def archive_candidates(
+        self,
+        candidate_ids: Iterable[int],
+        reason: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        ids = [int(candidate_id) for candidate_id in candidate_ids]
+        if not ids:
+            return 0
+        archived_at = utc_now()
+        metadata_json = _json(metadata or {})
+        archived_count = 0
+        with self.connection() as conn:
+            for candidate_id in ids:
+                row = conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+                if row is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO archived_candidates (
+                        original_candidate_id, expression, settings_json, source, status, alpha_id,
+                        metrics_json, checks_json, retry_count, created_at, updated_at,
+                        archived_at, prune_reason, archive_metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(row["id"]),
+                        row["expression"],
+                        row["settings_json"],
+                        row["source"],
+                        row["status"],
+                        row["alpha_id"],
+                        row["metrics_json"],
+                        row["checks_json"],
+                        row["retry_count"],
+                        row["created_at"],
+                        row["updated_at"],
+                        archived_at,
+                        reason,
+                        metadata_json,
+                    ),
+                )
+                event_rows = conn.execute("SELECT * FROM events WHERE candidate_id = ? ORDER BY id", (candidate_id,)).fetchall()
+                for event in event_rows:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO archived_events (
+                            original_event_id, candidate_id, event_type, metadata_json, created_at, archived_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            int(event["id"]),
+                            event["candidate_id"],
+                            event["event_type"],
+                            event["metadata_json"],
+                            event["created_at"],
+                            archived_at,
+                        ),
+                    )
+                conn.execute("DELETE FROM events WHERE candidate_id = ?", (candidate_id,))
+                conn.execute("DELETE FROM candidates WHERE id = ?", (candidate_id,))
+                archived_count += 1
+            if archived_count:
+                conn.execute(
+                    """
+                    INSERT INTO events (candidate_id, event_type, metadata_json, created_at)
+                    VALUES (NULL, 'history_pruned', ?, ?)
+                    """,
+                    (
+                        _json(
+                            {
+                                "reason": reason,
+                                "archived_count": archived_count,
+                                "candidate_ids": ids[:100],
+                                "metadata": metadata or {},
+                            }
+                        ),
+                        archived_at,
+                    ),
+                )
+        return archived_count
 
     def status_counts(self, created_since: Optional[str] = None) -> Dict[str, int]:
         with self.connection() as conn:

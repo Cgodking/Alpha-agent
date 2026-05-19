@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from .db import AlphaStore
 from .expression_similarity import expression_structure_key, expression_variant_key
+from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX
 from .preflight import ALLOWED_OPERATORS
 from .research_planner import analyze_research_history, build_experiment_plan, candidate_quality_summary, _extract_fields
 
@@ -70,6 +71,14 @@ def build_ai_research_context(
     )
 
     reference_project = _summarize_reference_project(resolved_reference_dir, target_settings, history_limit)
+    history_hygiene: Dict[str, Any] = {
+        "low_quality_score_max": DEFAULT_LOW_QUALITY_SCORE_MAX,
+        "suppressed_low_quality_failures": 0,
+        "policy": (
+            "Very weak failed candidates are not exposed as full expressions to the AI. They remain available through "
+            "aggregate failure, field, and structure statistics so the model learns what failed without copying bad templates."
+        ),
+    }
 
     context = {
         "target_settings": target_settings,
@@ -90,9 +99,16 @@ def build_ai_research_context(
         "knowledge": _load_knowledge(resolved_knowledge_dir),
         "datafields": field_catalog or {"available": False, "field_ids": []},
         "syntax_constraints": _syntax_constraints(store, history_limit),
-        "recent_failures": _recent_candidate_summaries(store, {"failed"}, history_limit),
+        "recent_failures": _recent_candidate_summaries(
+            store,
+            {"failed"},
+            history_limit,
+            hygiene=history_hygiene,
+            suppress_low_quality_failures=True,
+        ),
         "recent_pending": _recent_candidate_summaries(store, {"check_pending"}, history_limit),
         "recent_successes": _recent_candidate_summaries(store, {"approved", "submitted"}, history_limit),
+        "history_hygiene": history_hygiene,
         "submitted_field_avoidance": _submitted_field_avoidance(
             store,
             target_settings,
@@ -238,10 +254,39 @@ def _load_knowledge(knowledge_dir: Path) -> Dict[str, str]:
     return sections
 
 
-def _recent_candidate_summaries(store: AlphaStore, statuses: set[str], limit: int) -> List[Dict[str, Any]]:
+def _recent_candidate_summaries(
+    store: AlphaStore,
+    statuses: set[str],
+    limit: int,
+    *,
+    hygiene: Dict[str, Any] | None = None,
+    suppress_low_quality_failures: bool = False,
+) -> List[Dict[str, Any]]:
     summaries: List[Dict[str, Any]] = []
     for candidate in store.list_recent_candidates(max(RECENT_CONTEXT_SCAN_LIMIT, limit * 30)):
         if candidate["status"] not in statuses:
+            continue
+        settings = _loads_json(candidate.get("settings_json"))
+        metrics = _loads_json(candidate.get("metrics_json"))
+        checks = _loads_json(candidate.get("checks_json"))
+        quality = candidate_quality_summary(
+            {
+                "settings": settings if isinstance(settings, dict) else {},
+                "metrics": metrics if isinstance(metrics, dict) else {},
+                "checks": checks if isinstance(checks, (dict, list)) else {},
+            }
+        )
+        event_summary = _summarize_candidate_events(store, int(candidate["id"]))
+        simulation_errors = _simulation_errors(store, int(candidate["id"]))
+        if suppress_low_quality_failures and _is_low_quality_failure_context_noise(
+            candidate,
+            metrics if isinstance(metrics, dict) else {},
+            quality,
+            event_summary,
+            simulation_errors,
+        ):
+            if hygiene is not None:
+                hygiene["suppressed_low_quality_failures"] = int(hygiene.get("suppressed_low_quality_failures") or 0) + 1
             continue
         item = {
             "id": candidate["id"],
@@ -249,14 +294,12 @@ def _recent_candidate_summaries(store: AlphaStore, statuses: set[str], limit: in
             "status": candidate["status"],
             "alpha_id": candidate.get("alpha_id"),
             "retry_count": candidate.get("retry_count", 0),
-            "settings": _loads_json(candidate.get("settings_json")),
-            "metrics": _loads_json(candidate.get("metrics_json")),
-            "checks": _loads_json(candidate.get("checks_json")),
+            "settings": settings,
+            "metrics": metrics,
+            "checks": checks,
         }
-        event_summary = _summarize_candidate_events(store, int(candidate["id"]))
         if event_summary:
             item["last_relevant_event"] = event_summary
-        simulation_errors = _simulation_errors(store, int(candidate["id"]))
         if simulation_errors:
             item["simulation_errors"] = simulation_errors
         generated_metadata = _generated_metadata(store, int(candidate["id"]))
@@ -266,6 +309,41 @@ def _recent_candidate_summaries(store: AlphaStore, statuses: set[str], limit: in
         if len(summaries) >= limit:
             break
     return summaries
+
+
+def _is_low_quality_failure_context_noise(
+    candidate: Dict[str, Any],
+    metrics: Dict[str, Any],
+    quality: Dict[str, Any],
+    event_summary: Optional[Dict[str, Any]],
+    simulation_errors: List[Dict[str, Any]],
+) -> bool:
+    if str(candidate.get("status") or "") != "failed":
+        return False
+    if simulation_errors:
+        return False
+    event_type = str((event_summary or {}).get("event_type") or "")
+    if event_type.startswith("preflight_failed"):
+        return False
+    history_noise_score = _history_noise_score(metrics, quality)
+    if history_noise_score > DEFAULT_LOW_QUALITY_SCORE_MAX:
+        return False
+    failed_checks = {str(item).split(":", 1)[0].upper() for item in quality.get("failed_checks") or []}
+    if failed_checks & {"UNKNOWN_OPERATOR", "UNKNOWN_FIELD", "INVALID_EXPRESSION"}:
+        return False
+    return True
+
+
+def _history_noise_score(metrics: Dict[str, Any], quality: Dict[str, Any]) -> float:
+    raw_score = _float_or_none(quality.get("raw_score"))
+    if raw_score is None or raw_score == 0:
+        sharpe = max(0.0, _float_or_none(metrics.get("sharpe")) or 0.0)
+        fitness = max(0.0, _float_or_none(metrics.get("fitness")) or 0.0)
+        raw_score = sharpe + 0.35 * fitness
+    quality_score = _float_or_none(quality.get("quality_score"))
+    if quality_score is None:
+        return raw_score
+    return min(quality_score, raw_score)
 
 
 def _submitted_field_avoidance(

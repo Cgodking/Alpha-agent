@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from alpha.cli import main
+from alpha.db import AlphaStore
 
 
 class CliTests(unittest.TestCase):
@@ -40,6 +41,50 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(main(["--env-file", str(env_path), "--db", str(db_path), "run-once", "--batch-size", "1"]), 0)
 
             self.assertTrue(db_path.exists())
+
+    def test_cli_prune_history_dry_run_and_execute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "alpha.db"
+            env_path = self._local_env(tmp)
+            store = AlphaStore(db_path)
+            store.init()
+            candidate_id = store.insert_candidate(
+                "rank(dead_signal)",
+                {"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+                "model:G-1",
+            )
+            store.update_candidate(
+                candidate_id,
+                metrics_json=json.dumps({"sharpe": 0.0, "fitness": 0.0}),
+                checks_json=json.dumps({"LOW_SHARPE": {"status": "FAIL", "value": 0.0, "limit": 1.58}}),
+            )
+            store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+
+            with patch.dict(os.environ, {}, clear=True):
+                dry_stdout = io.StringIO()
+                with redirect_stdout(dry_stdout):
+                    dry_code = main(["--env-file", str(env_path), "--db", str(db_path), "prune-history", "--all-scopes"])
+                execute_stdout = io.StringIO()
+                with redirect_stdout(execute_stdout):
+                    execute_code = main(
+                        [
+                            "--env-file",
+                            str(env_path),
+                            "--db",
+                            str(db_path),
+                            "prune-history",
+                            "--all-scopes",
+                            "--execute",
+                        ]
+                    )
+
+            self.assertEqual(dry_code, 0)
+            self.assertEqual(execute_code, 0)
+            self.assertIn("'selected': 1", dry_stdout.getvalue())
+            self.assertIn("'archived': 1", execute_stdout.getvalue())
+            self.assertIsNotNone(store.find_duplicate_candidate("rank(dead_signal)", {"region": "USA", "delay": 1}))
+            with self.assertRaises(KeyError):
+                store.get_candidate(candidate_id)
 
     def test_cli_run_once_accepts_us_d0_preset(self):
         with tempfile.TemporaryDirectory() as tmp:

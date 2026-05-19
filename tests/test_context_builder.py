@@ -1326,6 +1326,32 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(route["watchlist_count"], 1)
         self.assertFalse(route["stop_loss_active"])
 
+    def test_build_ai_research_context_suppresses_low_quality_failure_expressions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            settings = {"region": "USA", "universe": "TOP3000", "delay": 0, "neutralization": "INDUSTRY"}
+            candidate_id = store.insert_candidate("rank(template_trap_signal)", settings, "model:G-1")
+            store.update_candidate(
+                candidate_id,
+                metrics_json=json.dumps({"sharpe": 0.0, "fitness": 0.0, "turnover": 0.2}),
+                checks_json=json.dumps({"LOW_SHARPE": {"status": "FAIL", "value": 0.0, "limit": 2.69}}),
+            )
+            store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+
+            context = build_ai_research_context(
+                store,
+                settings,
+                knowledge_dir=base / "missing-knowledge",
+                reference_dir=base / "missing-reference",
+                field_catalog={"available": True, "field_ids": ["template_trap_signal"], "fields": []},
+            )
+
+        self.assertEqual(context["recent_failures"], [])
+        self.assertEqual(context["history_hygiene"]["suppressed_low_quality_failures"], 1)
+        self.assertEqual(context["history_hygiene"]["low_quality_score_max"], 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()

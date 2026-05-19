@@ -12,6 +12,7 @@ from .context_builder import build_ai_research_context
 from .db import AlphaStore, utc_now
 from .env_file import load_env_file
 from .field_catalog import build_field_catalog
+from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX, prune_low_quality_history
 from .logging_utils import setup_logging
 from .scopes import SCOPE_PRESETS, apply_scope, preset_rows
 from .scope_rotation import next_rotating_scope, parse_scope_json
@@ -40,6 +41,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_scope_args(daemon)
 
     sub.add_parser("status", help="打印候选状态统计")
+    prune = sub.add_parser("prune-history", help="归档并删除低质量失败探索记录")
+    prune.add_argument("--quality-max", type=float, default=DEFAULT_LOW_QUALITY_SCORE_MAX)
+    prune.add_argument("--limit", type=int, default=1000)
+    prune.add_argument("--execute", action="store_true", help="真正执行归档删除；不加则只预览")
+    prune.add_argument("--all-scopes", action="store_true", help="清理所有 scope；默认只清理当前 scope")
+    _add_scope_args(prune)
     sub.add_parser("presets", help="打印可用探索 scope 预设")
     sub.add_parser("submit-approved", help="提交已通过 guard 的候选")
     check_ai = sub.add_parser("check-ai", help="只生成一个 AI 候选，不做 BRAIN 回测")
@@ -176,6 +183,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("no candidates")
         for status, count in counts.items():
             print(f"{status}: {count}")
+        return 0
+
+    if args.command == "prune-history":
+        target = None if args.all_scopes else simulation_context
+        summary = prune_low_quality_history(
+            store,
+            target,
+            quality_max=args.quality_max,
+            limit=args.limit,
+            execute=bool(args.execute),
+        )
+        log.info("prune_history summary=%s", summary)
+        print(summary)
         return 0
 
     if args.command == "presets":

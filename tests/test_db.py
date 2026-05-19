@@ -123,6 +123,30 @@ class AlphaStoreTests(unittest.TestCase):
             self.assertEqual([row["id"] for row in failed], [third_id, second_id])
             self.assertNotIn(first_id, [row["id"] for row in recent])
 
+    def test_store_archives_candidates_and_keeps_duplicate_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            settings = {"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"}
+            candidate_id = store.insert_candidate("rank(stale_signal)", settings, "model:G-1")
+            store.record_event(candidate_id, "generated", {"batch": 1})
+            store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+
+            archived = store.archive_candidates([candidate_id], "low_quality_history", {"quality_score": 0.0})
+            duplicate = store.find_duplicate_candidate("rank(stale_signal)", settings)
+
+            self.assertEqual(archived, 1)
+            with self.assertRaises(KeyError):
+                store.get_candidate(candidate_id)
+            self.assertIsNotNone(duplicate)
+            self.assertEqual(duplicate["id"], candidate_id)
+            self.assertTrue(duplicate["archived"])
+            with store.connection() as conn:
+                archived_candidate_count = conn.execute("SELECT COUNT(*) FROM archived_candidates").fetchone()[0]
+                archived_event_count = conn.execute("SELECT COUNT(*) FROM archived_events").fetchone()[0]
+            self.assertEqual(archived_candidate_count, 1)
+            self.assertEqual(archived_event_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
