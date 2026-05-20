@@ -952,24 +952,110 @@ class OpenAICompatibleAIClient:
     @staticmethod
     def _extract_content(response: Dict[str, Any]) -> str:
         if "output_text" in response:
-            return str(response["output_text"])
+            return OpenAICompatibleAIClient._content_to_text(response["output_text"])
         choices = response.get("choices") or []
         if choices:
             message = choices[0].get("message") or {}
-            return str(message.get("content") or "")
+            content = OpenAICompatibleAIClient._content_to_text(message.get("content"))
+            if content.strip():
+                return content
+            for fallback_key in ("text", "reasoning_content", "reasoning"):
+                content = OpenAICompatibleAIClient._content_to_text(message.get(fallback_key))
+                if content.strip():
+                    return content
+            content = OpenAICompatibleAIClient._content_to_text(choices[0].get("text"))
+            if content.strip():
+                return content
+            finish_reason = str(choices[0].get("finish_reason") or "")
+            raise ValueError(f"AI response content empty finish_reason={finish_reason or 'unknown'}")
         raise ValueError("AI response did not contain candidate content")
 
     @staticmethod
     def _parse_json_content(content: str) -> Any:
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-        return json.loads(text)
+        text = str(content or "").strip().lstrip("\ufeff")
+        if not text:
+            raise AIClientError("AI response content empty")
+
+        candidates = [text]
+        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+            fenced = match.group(1).strip()
+            if fenced and fenced not in candidates:
+                candidates.append(fenced)
+        balanced = OpenAICompatibleAIClient._extract_balanced_json_payload(text)
+        if balanced and balanced not in candidates:
+            candidates.append(balanced)
+
+        last_error: json.JSONDecodeError | None = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        preview = _truncate_text(text.replace("\n", "\\n"), 500)
+        if last_error is not None:
+            raise AIClientError(f"AI response invalid JSON: {last_error}; preview={preview!r}") from last_error
+        raise AIClientError(f"AI response invalid JSON; preview={preview!r}")
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    for key in ("text", "content", "output_text"):
+                        value = item.get(key)
+                        if isinstance(value, str):
+                            parts.append(value)
+                            break
+                elif item is not None:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        return str(content)
+
+    @staticmethod
+    def _extract_balanced_json_payload(text: str) -> str:
+        for index, char in enumerate(text):
+            if char not in "{[":
+                continue
+            end = OpenAICompatibleAIClient._balanced_json_end(text, index)
+            if end is not None:
+                return text[index:end]
+        return ""
+
+    @staticmethod
+    def _balanced_json_end(text: str, start: int) -> int | None:
+        stack: List[str] = []
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == "\"":
+                    in_string = False
+                continue
+            if char == "\"":
+                in_string = True
+            elif char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char in "}]":
+                if not stack or char != stack[-1]:
+                    return None
+                stack.pop()
+                if not stack:
+                    return index + 1
+        return None
 
 
 class MultiModelAIClient:

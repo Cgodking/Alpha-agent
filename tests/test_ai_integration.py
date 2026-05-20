@@ -427,6 +427,43 @@ class AiIntegrationTests(unittest.TestCase):
 
         self.assertIn("invalid JSON", str(ctx.exception))
 
+    def test_openai_client_extracts_json_from_wrapped_model_response(self):
+        client = OpenAICompatibleAIClient(
+            api_key="test",
+            model="model-x",
+            transport=lambda _payload: {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "Here are the candidates.\n"
+                                "```json\n"
+                                "{\"candidates\":[{\"expression\":\"rank(ts_mean(close,22))\"}]}\n"
+                                "```"
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+        candidates = client.generate_candidates(1, {"region": "USA"})
+
+        self.assertEqual(candidates[0].expression, "rank(ts_mean(close,22))")
+
+    def test_openai_client_reports_invalid_json_with_response_preview(self):
+        client = OpenAICompatibleAIClient(
+            api_key="test",
+            model="model-x",
+            transport=lambda _payload: {"choices": [{"message": {"content": "not-json response body"}}]},
+        )
+
+        with self.assertRaises(AIClientError) as ctx:
+            client.generate_candidates(1, {"region": "USA"})
+
+        self.assertIn("invalid JSON", str(ctx.exception))
+        self.assertIn("not-json response body", str(ctx.exception))
+
     def test_openai_client_from_env_reads_ai_settings(self):
         with patch.dict(
             os.environ,
