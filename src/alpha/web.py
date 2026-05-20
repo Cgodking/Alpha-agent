@@ -20,6 +20,7 @@ from .context_builder import build_ai_research_context
 from .db import AlphaStore, utc_now
 from .env_file import load_env_file
 from .field_catalog import build_field_catalog
+from .field_scout import build_field_scout
 from .scopes import SCOPE_PRESETS, platform_scope_rows, preset_rows
 
 
@@ -335,6 +336,7 @@ class ControlService:
             scope.update({key: value for key, value in selected_scope.items() if key != "preset"})
         brain = BrainHTTPClient.from_env() if cfg.brain_client in {"http", "brain_http", "live"} else LocalBrainClient()
         catalog = build_field_catalog(brain, scope)
+        catalog["field_scout"] = build_field_scout(catalog)
         catalog["field_ids"] = list(catalog.get("field_ids") or [])[:limit]
         return catalog
 
@@ -1086,7 +1088,15 @@ HTML = r"""<!doctype html>
       const data = await api(`/api/fields?${params.toString()}`);
       const ids = data.field_ids || [];
       const datasets = (data.datasets || []).slice(0, 8).map(d => `${d.id}:${d.field_count}`).join(', ');
-      $('fields').textContent = `available=${data.available} source=${data.source || 'unknown'}\n${datasets}\n${ids.join(', ')}`;
+      const scout = data.field_scout || {};
+      const topScout = (scout.top_fields || []).slice(0, 12)
+        .map(f => `${f.field} score=${Number(f.score || 0).toFixed(3)} ${f.category || ''} ${f.primary_policy || ''}`)
+        .join('\n');
+      const buckets = (scout.buckets || []).slice(0, 5)
+        .map(b => `${b.name}: ${(b.fields || []).slice(0, 12).join(', ')}`)
+        .join('\n');
+      $('fields').textContent =
+        `available=${data.available} source=${data.source || 'unknown'}\n${datasets}\n\nfield scout\n${topScout || '(empty)'}\n\nbuckets\n${buckets || '(empty)'}\n\nfield ids\n${ids.join(', ')}`;
     }
     function escapeHtml(value) {
       return String(value || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));

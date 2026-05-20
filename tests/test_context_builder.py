@@ -74,6 +74,55 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(context["recent_failures"][0]["simulation_errors"][0]["error"], "Attempted to use unknown variable x")
         self.assertEqual(context["recent_successes"][0]["expression"], "group_rank(ts_rank(ts_delta(close, 5), 22), industry)")
 
+    def test_build_ai_research_context_includes_field_scout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            settings = {"region": "USA", "universe": "TOP3000", "delay": 0}
+            failed_id = store.insert_candidate("rank(failed_signal)", settings, "model:G-1")
+            store.update_candidate(failed_id, metrics_json=json.dumps({"sharpe": -0.2, "fitness": -0.1}))
+            store.transition(failed_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+
+            context = build_ai_research_context(
+                store,
+                settings,
+                knowledge_dir=base / "missing-knowledge",
+                reference_dir=base / "missing-reference",
+                field_catalog={
+                    "available": True,
+                    "field_ids": ["rare_signal", "failed_signal"],
+                    "fields": [
+                        {
+                            "id": "rare_signal",
+                            "type": "MATRIX",
+                            "dataset_id": "news",
+                            "category": "News",
+                            "coverage": 0.9,
+                            "userCount": 0,
+                            "alphaCount": 0,
+                            "pyramidMultiplier": 1.8,
+                        },
+                        {
+                            "id": "failed_signal",
+                            "type": "MATRIX",
+                            "dataset_id": "model",
+                            "category": "Model",
+                            "coverage": 0.9,
+                            "userCount": 0,
+                            "alphaCount": 0,
+                            "pyramidMultiplier": 1.8,
+                        },
+                    ],
+                },
+            )
+
+        scout = context["field_scout"]
+        self.assertTrue(scout["active"])
+        self.assertEqual(scout["top_fields"][0]["field"], "rare_signal")
+        self.assertIn("field_scout", context["experiment_plan"])
+        self.assertIn("high_opportunity_unexplored", [bucket["name"] for bucket in scout["buckets"]])
+
     def test_build_ai_research_context_adds_syntax_constraints_and_preflight_rejections(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

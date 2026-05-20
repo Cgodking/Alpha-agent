@@ -210,6 +210,7 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
     lit_tower_avoidance = (
         research_context.get("lit_tower_avoidance") if isinstance(research_context.get("lit_tower_avoidance"), dict) else {}
     )
+    field_scout = research_context.get("field_scout") if isinstance(research_context.get("field_scout"), dict) else {}
 
     return {
         "candidate_count": len(candidates),
@@ -224,6 +225,7 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
         "submitted_field_avoidance": research_context.get("submitted_field_avoidance") or {},
         "submitted_avoid_fields": submitted_avoid_fields,
         "lit_tower_avoidance": lit_tower_avoidance,
+        "field_scout": field_scout,
         "mechanism_memory": mechanism_memory,
         "scope_health": scope_health,
         "route_efficiency": route_efficiency,
@@ -257,6 +259,8 @@ def build_experiment_plan(
     structure_diversity_control = (
         analysis.get("structure_diversity_control") if isinstance(analysis.get("structure_diversity_control"), dict) else {}
     )
+    field_scout = analysis.get("field_scout") if isinstance(analysis.get("field_scout"), dict) else {}
+    field_scout_for_plan = _compact_field_scout_for_plan(field_scout)
     optimization_state = analysis.get("optimization_state") if isinstance(analysis.get("optimization_state"), dict) else {}
     sharpe = _float(best.get("sharpe"))
     fitness = _float(best.get("fitness"))
@@ -299,6 +303,7 @@ def build_experiment_plan(
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
+            "field_scout": field_scout_for_plan,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
             "route_stop_loss": route_stop_loss,
@@ -333,6 +338,7 @@ def build_experiment_plan(
             "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields + list(best.get("fields") or [])),
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
+            "field_scout": field_scout_for_plan,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
             "route_stop_loss": route_stop_loss,
@@ -373,6 +379,7 @@ def build_experiment_plan(
             "setting_variants": _setting_variants(target_settings, batch_size),
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
+            "field_scout": field_scout_for_plan,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
             "route_stop_loss": route_stop_loss,
@@ -430,6 +437,7 @@ def build_experiment_plan(
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
+            "field_scout": field_scout_for_plan,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
             "route_stop_loss": route_stop_loss,
@@ -477,6 +485,7 @@ def build_experiment_plan(
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
+            "field_scout": field_scout_for_plan,
             "scope_trouble": scope_trouble,
             "mechanism_transfer": mechanism_transfer,
             "route_stop_loss": route_stop_loss,
@@ -504,6 +513,7 @@ def build_experiment_plan(
         "family_diversity_control": family_diversity_control,
         "submitted_field_avoidance": submitted_avoidance,
         "lit_tower_avoidance": lit_tower_avoidance,
+        "field_scout": field_scout_for_plan,
         "scope_trouble": scope_trouble,
         "mechanism_transfer": mechanism_transfer,
         "route_stop_loss": route_stop_loss,
@@ -512,6 +522,49 @@ def build_experiment_plan(
         "target_settings": dict(target_settings),
         "quality_thresholds": quality_thresholds,
     }
+
+
+def _compact_field_scout_for_plan(field_scout: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(field_scout, dict):
+        return {}
+    compact: Dict[str, Any] = {}
+    for key in ("active", "policy", "scoring"):
+        if key in field_scout:
+            compact[key] = field_scout[key]
+    top_fields = field_scout.get("top_fields")
+    if isinstance(top_fields, list):
+        keep_keys = (
+            "field",
+            "score",
+            "type",
+            "dataset_id",
+            "category",
+            "coverage",
+            "userCount",
+            "alphaCount",
+            "pyramidMultiplier",
+            "explored_count",
+            "failed_count",
+            "tower_status",
+            "primary_policy",
+        )
+        compact["top_fields"] = [
+            {key: row.get(key) for key in keep_keys if key in row}
+            for row in top_fields[:30]
+            if isinstance(row, dict)
+        ]
+    buckets = field_scout.get("buckets")
+    if isinstance(buckets, list):
+        compact["buckets"] = [
+            {
+                "name": bucket.get("name"),
+                "fields": [str(field) for field in (bucket.get("fields") or [])[:12]],
+                "rationale": bucket.get("rationale"),
+            }
+            for bucket in buckets[:6]
+            if isinstance(bucket, dict)
+        ]
+    return compact
 
 
 def _candidate_pool(research_context: Dict[str, Any], target_settings: Dict[str, Any]) -> List[Dict[str, Any]]:

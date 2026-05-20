@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIELD_CACHE_DIR = PROJECT_ROOT / "data" / "field_cache"
 DEFAULT_FIELD_SEARCH_TERMS = ["", "model", "analyst", "fundamental", "pv", "news", "sentiment"]
-DEFAULT_FIELD_LIMIT = 120
+DEFAULT_FIELD_LIMIT = 600
 DEFAULT_FIELD_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 BUILTIN_FIELDS = [

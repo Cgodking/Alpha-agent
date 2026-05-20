@@ -12,6 +12,7 @@ from .context_builder import build_ai_research_context
 from .db import AlphaStore, utc_now
 from .env_file import load_env_file
 from .field_catalog import build_field_catalog
+from .field_scout import build_field_scout
 from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX, prune_low_quality_history
 from .logging_utils import setup_logging
 from .scopes import SCOPE_PRESETS, apply_scope, preset_rows
@@ -238,6 +239,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("datasets:")
             for dataset in datasets[:10]:
                 print(f"  {dataset.get('id')}: {dataset.get('field_count')} fields")
+        scout = build_field_scout(catalog)
+        top_fields = scout.get("top_fields") if isinstance(scout.get("top_fields"), list) else []
+        if top_fields:
+            print("field_scout:")
+            for row in top_fields[: min(args.limit, 20)]:
+                print(
+                    f"  {row.get('field')}: score={row.get('score')} "
+                    f"category={row.get('category')} policy={row.get('primary_policy')}"
+                )
         print("field_ids:")
         for field_id in (catalog.get("field_ids") or [])[: args.limit]:
             print(f"  {field_id}")

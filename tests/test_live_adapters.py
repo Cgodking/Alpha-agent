@@ -387,6 +387,58 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(fields[0]["id"], "field_after_retry")
         self.assertEqual(len(session.calls), 2)
 
+    def test_brain_http_client_paginates_datafield_discovery(self):
+        session = FakeSession()
+        first_page = [{"id": f"field_{idx}", "type": "MATRIX"} for idx in range(50)]
+        second_page = [{"id": f"field_{idx}", "type": "MATRIX"} for idx in range(50, 75)]
+        session.route(
+            "GET",
+            "/data-fields",
+            [
+                FakeResponse(200, {"results": first_page}),
+                FakeResponse(200, {"results": second_page}),
+            ],
+        )
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        fields = client.discover_datafields({"region": "USA", "universe": "TOP500", "delay": 0}, max_fields=75)
+
+        self.assertEqual(len(fields), 75)
+        offsets = [call[2]["params"]["offset"] for call in session.calls]
+        self.assertEqual(offsets, [0, 50])
+
+    def test_brain_http_client_spreads_datafield_discovery_across_search_terms(self):
+        class SearchAwareSession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                path = url.replace("https://api.worldquantbrain.com", "")
+                self.calls.append(("GET", path, kwargs))
+                params = kwargs.get("params", {})
+                search = params.get("search", "")
+                offset = int(params.get("offset", 0))
+                if search == "news":
+                    return FakeResponse(200, {"results": [{"id": f"news_field_{idx}", "type": "MATRIX"} for idx in range(10)]})
+                return FakeResponse(
+                    200,
+                    {"results": [{"id": f"general_field_{idx}", "type": "MATRIX"} for idx in range(offset, offset + 50)]},
+                )
+
+        session = SearchAwareSession()
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        fields = client.discover_datafields(
+            {"region": "USA", "universe": "TOP500", "delay": 0},
+            search_terms=["", "news"],
+            max_fields=60,
+        )
+
+        ids = [field["id"] for field in fields]
+        self.assertIn("news_field_0", ids)
+        searches = [call[2]["params"].get("search", "") for call in session.calls]
+        self.assertIn("news", searches)
+
     def test_brain_http_client_loads_credentials_file_from_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             cred_path = Path(tmp) / "brain_credentials.txt"

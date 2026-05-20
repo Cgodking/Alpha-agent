@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from .db import AlphaStore
 from .expression_similarity import expression_structure_key, expression_variant_key
+from .field_scout import build_field_scout
 from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX
 from .preflight import ALLOWED_OPERATORS
 from .research_planner import analyze_research_history, build_experiment_plan, candidate_quality_summary, _extract_fields
@@ -152,6 +153,16 @@ def build_ai_research_context(
         _field_ids_from_catalog(field_catalog),
         submitted_avoidance=context.get("submitted_field_avoidance"),
         lit_tower_avoidance=context.get("lit_tower_avoidance"),
+    )
+    context["field_scout"] = build_field_scout(
+        context.get("datafields") if isinstance(context.get("datafields"), dict) else {},
+        history_memory=context.get("history_memory") if isinstance(context.get("history_memory"), dict) else {},
+        submitted_avoidance=context.get("submitted_field_avoidance")
+        if isinstance(context.get("submitted_field_avoidance"), dict)
+        else {},
+        lit_tower_avoidance=context.get("lit_tower_avoidance")
+        if isinstance(context.get("lit_tower_avoidance"), dict)
+        else {},
     )
     analysis = analyze_research_history(context)
     context["analysis"] = analysis

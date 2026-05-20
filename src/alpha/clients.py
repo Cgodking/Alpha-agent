@@ -471,6 +471,9 @@ class OpenAICompatibleAIClient:
             "If research_context.lit_tower_avoidance or experiment_plan.lit_tower_avoidance is present, prefer "
             "unlit pyramid towers for fresh exploration and keep already-lit towers out of new profile routes unless "
             "the plan is explicitly optimizing a near-threshold candidate. "
+            "If research_context.field_scout or experiment_plan.field_scout is present, use it as the field-selection "
+            "map: assign different top_fields or bucket routes to active profiles, prefer high-score fields as primary "
+            "signals, and do not assign fields marked primary_policy=avoid_primary as main alpha legs. "
             "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism-only "
             "evidence. Do not copy their expressions or forbidden_fields; assign routes that migrate those mechanisms "
             "to fresh non-submitted primary fields. "
@@ -508,6 +511,7 @@ class OpenAICompatibleAIClient:
             "Flag any plan that reuses fields listed in submitted_field_avoidance or submitted_avoid_fields, because "
             "passing variants are likely to fail self/prod correlation. "
             "Flag fresh-exploration plans that ignore lit_tower_avoidance when platform pyramid evidence is present. "
+            "Flag plans that ignore field_scout top_fields/buckets or choose primary fields marked avoid_primary. "
             "When mechanism_transfer is present, flag plans that copy blocked expressions or forbidden_fields instead "
             "of transferring the mechanism to new primary fields. "
             "When route_stop_loss or structure_diversity_control is present, flag plans that only swap fields inside "
@@ -551,7 +555,8 @@ class OpenAICompatibleAIClient:
             "constraint: choose unlit pyramid towers for fresh exploration whenever possible. If mechanism_transfer "
             "is active, keep it mechanism only: Do not copy blocked fields or expressions, and route profiles toward "
             "fresh primary fields that preserve the historical signal logic. Preserve route_stop_loss and "
-            "structure_diversity_control by forcing different mechanism classes and formula skeletons."
+            "structure_diversity_control by forcing different mechanism classes and formula skeletons. Preserve "
+            "field_scout as the primary field-selection map, with distinct top_fields or buckets per profile."
         )
         user = json.dumps(
             {
@@ -583,6 +588,8 @@ class OpenAICompatibleAIClient:
             "Do not make the final decision. Identify concrete repair needs: validator removals, duplicate structures, "
             "weak or off-plan mechanisms, repeated exhausted fields, invalid syntax risk, and missing profile coverage. "
             "Also flag fresh candidates that ignore lit_tower_avoidance when the final plan chose unlit pyramid routes. "
+            "Flag fresh candidates whose primary fields are outside final_plan.field_scout routes when those routes "
+            "are present, or whose primary fields are marked avoid_primary. "
             "When final_plan.mechanism_transfer is present, reject candidates that copy mechanism_transfer "
             "forbidden_fields as primary fields instead of transferring the mechanism. "
             "When final_plan.structure_diversity_control is present, reject candidates that refill the batch with "
@@ -627,6 +634,8 @@ class OpenAICompatibleAIClient:
             "Only choose refill/repair when the batch has useful accepted candidates but needs replacement candidates "
             "before simulation. Do not allocate counts unless refill/repair is needed. "
             "When replacement candidates are needed, preserve submitted-field constraints and lit_tower_avoidance. "
+            "When field_scout routes are present, replacement candidates must use unused high-score fields or buckets "
+            "from that scout unless the accepted batch already covers them. "
             "If mechanism_transfer is present, use it only for mechanism transfer and never for copying its "
             "forbidden_fields or exact expressions. "
             "If structure_diversity_control is present, replacement candidates must use a different formula skeleton "
@@ -779,19 +788,22 @@ class OpenAICompatibleAIClient:
                         "If research_context.experiment_plan.family_diversity_control is present, keep the dominant "
                         "family anchored to a single profile at most and use alternate_families for the other "
                         "active profiles. "
-            "If research_context.experiment_plan.submitted_field_avoidance is present, do not use its "
-            "approved/submitted core fields or close variants of those successful alphas. "
-            "If research_context.experiment_plan.lit_tower_avoidance is present, avoid already-lit pyramid towers "
-            "for fresh exploration and prefer the listed unlit_towers; this is a diversity constraint, not a license "
-            "to infer tower status from field names. "
-            "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism only "
-            "examples. Do not copy their expressions. Do not copy forbidden_fields into primary alpha legs. Transfer "
-            "the mechanism to fresh, allowed, non-submitted fields while keeping auxiliary fields only as helpers. "
-            "If research_context.experiment_plan.route_stop_loss is active, do not keep optimizing the same route; "
-            "change mechanism class and operator geometry. If structure_diversity_control is present, generate no "
-            "more than its max_batch_candidates_per_structure candidates per field-agnostic formula skeleton. "
-            "If research_context.profile_guidance is present, treat it as mandatory model-specific "
-            "direction and generate candidates only within that assigned route. "
+                        "If research_context.experiment_plan.submitted_field_avoidance is present, do not use its "
+                        "approved/submitted core fields or close variants of those successful alphas. "
+                        "If research_context.experiment_plan.lit_tower_avoidance is present, avoid already-lit pyramid towers "
+                        "for fresh exploration and prefer the listed unlit_towers; this is a diversity constraint, not a license "
+                        "to infer tower status from field names. "
+                        "If research_context.experiment_plan.field_scout is present, choose primary signal fields from its "
+                        "top_fields or the profile-assigned bucket. Respect primary_policy=avoid_primary: those fields may "
+                        "only be helpers. Diversify candidates across the scout buckets instead of repeatedly reusing one field. "
+                        "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism only "
+                        "examples. Do not copy their expressions. Do not copy forbidden_fields into primary alpha legs. Transfer "
+                        "the mechanism to fresh, allowed, non-submitted fields while keeping auxiliary fields only as helpers. "
+                        "If research_context.experiment_plan.route_stop_loss is active, do not keep optimizing the same route; "
+                        "change mechanism class and operator geometry. If structure_diversity_control is present, generate no "
+                        "more than its max_batch_candidates_per_structure candidates per field-agnostic formula skeleton. "
+                        "If research_context.profile_guidance is present, treat it as mandatory model-specific "
+                        "direction and generate candidates only within that assigned route. "
                         "Treat research_context.syntax_constraints as hard syntax policy: use only its "
                         "allowed_operators, avoid its recent_preflight_rejections, and copy field ids exactly. "
                         "Treat research_context.syntax_constraints.auxiliary_only_fields as helper fields only: "
@@ -2062,6 +2074,8 @@ def _compact_controller_research_context(research_context: Dict[str, Any]) -> Di
         compact["submitted_field_avoidance"] = _compact_submitted_avoidance(research_context["submitted_field_avoidance"])
     if isinstance(research_context.get("lit_tower_avoidance"), dict):
         compact["lit_tower_avoidance"] = _compact_lit_tower_avoidance(research_context["lit_tower_avoidance"])
+    if isinstance(research_context.get("field_scout"), dict):
+        compact["field_scout"] = _compact_field_scout(research_context["field_scout"])
     if isinstance(research_context.get("candidate_queues"), dict):
         compact["candidate_queues"] = _compact_candidate_queues(research_context["candidate_queues"])
     for key in ("recent_failures", "recent_pending", "recent_successes"):
@@ -2184,6 +2198,47 @@ def _compact_lit_tower_avoidance(avoidance: Dict[str, Any]) -> Dict[str, Any]:
         rows = avoidance.get(key)
         if isinstance(rows, list):
             compact[key] = [_compact_generic(item, depth=0, list_limit=12) for item in rows[:12]]
+    return compact
+
+
+def _compact_field_scout(field_scout: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for key in ("active", "policy", "scoring"):
+        if key in field_scout:
+            compact[key] = _compact_generic(field_scout[key], depth=0, list_limit=20)
+    top_fields = field_scout.get("top_fields")
+    if isinstance(top_fields, list):
+        keep_keys = (
+            "field",
+            "score",
+            "type",
+            "dataset_id",
+            "category",
+            "coverage",
+            "userCount",
+            "alphaCount",
+            "pyramidMultiplier",
+            "explored_count",
+            "failed_count",
+            "tower_status",
+            "primary_policy",
+        )
+        compact["top_fields"] = [
+            {key: _compact_generic(row[key], depth=0, list_limit=4) for key in keep_keys if key in row}
+            for row in top_fields[:40]
+            if isinstance(row, dict)
+        ]
+    buckets = field_scout.get("buckets")
+    if isinstance(buckets, list):
+        compact["buckets"] = [
+            {
+                "name": bucket.get("name"),
+                "fields": [str(field) for field in (bucket.get("fields") or [])[:16]],
+                "rationale": _truncate_text(bucket.get("rationale"), 240),
+            }
+            for bucket in buckets[:8]
+            if isinstance(bucket, dict)
+        ]
     return compact
 
 
@@ -2751,28 +2806,41 @@ class BrainHTTPClient:
         seen = set()
         terms = search_terms if search_terms is not None else [""]
         per_request_limit = min(50, max_fields)
+        per_term_limit = max_fields
+        if search_terms is not None and len(terms) > 1:
+            per_term_limit = max(per_request_limit, (max_fields + len(terms) - 1) // len(terms))
         for term in terms:
-            if len(rows) >= max_fields:
-                break
-            params = dict(scope)
-            params.update({"limit": per_request_limit, "offset": 0})
-            if term:
-                params["search"] = term
-            response = self._get_with_rate_limit_retry(f"{self.base_url}/data-fields", params=params)
-            if response.status_code != 200:
-                raise RuntimeError(f"datafield discovery failed: HTTP {response.status_code} {response.text[:200]}")
-            payload = response.json()
-            candidates = payload.get("results", []) if isinstance(payload, dict) else []
-            for row in candidates:
-                if not isinstance(row, dict):
-                    continue
-                field_id = row.get("id")
-                if not field_id or field_id in seen:
-                    continue
-                seen.add(field_id)
-                rows.append(row)
+            offset = 0
+            term_added = 0
+            while len(rows) < max_fields and term_added < per_term_limit:
+                request_limit = min(per_request_limit, max_fields - len(rows), per_term_limit - term_added)
+                params = dict(scope)
+                params.update({"limit": request_limit, "offset": offset})
+                if term:
+                    params["search"] = term
+                response = self._get_with_rate_limit_retry(f"{self.base_url}/data-fields", params=params)
+                if response.status_code != 200:
+                    raise RuntimeError(f"datafield discovery failed: HTTP {response.status_code} {response.text[:200]}")
+                payload = response.json()
+                candidates = payload.get("results", []) if isinstance(payload, dict) else []
+                if not candidates:
+                    break
+                for row in candidates:
+                    if not isinstance(row, dict):
+                        continue
+                    field_id = row.get("id")
+                    if not field_id or field_id in seen:
+                        continue
+                    seen.add(field_id)
+                    rows.append(row)
+                    term_added += 1
+                    if len(rows) >= max_fields:
+                        break
                 if len(rows) >= max_fields:
                     break
+                if len(candidates) < request_limit:
+                    break
+                offset += request_limit
         return rows
 
     def _get_with_rate_limit_retry(self, url: str, params: Dict[str, Any]) -> Any:
