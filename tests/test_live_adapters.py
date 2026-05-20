@@ -201,6 +201,28 @@ class LiveAdapterTests(unittest.TestCase):
         alpha_detail_calls = [call for call in session.calls if call[0:2] == ("GET", "/alphas/alpha1")]
         self.assertEqual(len(alpha_detail_calls), 2)
 
+    def test_brain_http_client_does_not_use_simulation_id_as_alpha_id(self):
+        session = FakeSession()
+        session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/sim1"}))
+        session.route(
+            "GET",
+            "/simulations/sim1",
+            [
+                FakeResponse(200, {"id": "sim1", "status": "COMPLETE"}),
+                FakeResponse(200, {"id": "sim1", "status": "COMPLETE", "alpha": "alpha1"}),
+            ],
+        )
+        session.route("GET", "/alphas/sim1", FakeResponse(404, {"message": "simulation id is not an alpha"}))
+        session.route("GET", "/alphas/alpha1", FakeResponse(200, {"is": {"sharpe": 2.0, "fitness": 1.1}}))
+        session.route("POST", "/alphas/alpha1/check", FakeResponse(200, headers={}))
+        session.route("GET", "/alphas/alpha1/check", FakeResponse(200, {}))
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        result = client.simulate("rank(close)", {"region": "USA", "universe": "TOP3000", "delay": 1})
+
+        self.assertEqual(result.alpha_id, "alpha1")
+        self.assertNotIn(("GET", "/alphas/sim1", {}), session.calls)
+
     def test_brain_http_client_raises_platform_simulation_error(self):
         session = FakeSession()
         session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/err"}))

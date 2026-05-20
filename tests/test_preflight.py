@@ -134,6 +134,16 @@ class PreflightTests(unittest.TestCase):
 
         self.assertIn("EMPTY_FUNCTION_ARGUMENT", errors)
 
+    def test_validate_expression_rejects_group_mean_wrong_arity(self):
+        errors = validate_expression("group_mean(ts_mean(close, 22), industry)")
+
+        self.assertIn("INVALID_OPERATOR_ARITY:group_mean:2!=3", errors)
+
+    def test_validate_expression_rejects_hump_wrong_arity(self):
+        errors = validate_expression("group_rank(hump(ts_mean(close,55),0.01),industry)")
+
+        self.assertIn("INVALID_OPERATOR_ARITY:hump:2!=1", errors)
+
     def test_worker_fails_candidate_before_simulation_when_preflight_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = AlphaStore(Path(tmp) / "alpha.db")

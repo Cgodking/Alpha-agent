@@ -129,6 +129,11 @@ RESERVED_IDENTIFIERS = {
     "rettype",
 }
 
+EXACT_OPERATOR_ARITY = {
+    "group_mean": 3,
+    "hump": 1,
+}
+
 
 def validate_expression(
     expression: str,
@@ -163,6 +168,7 @@ def validate_expression(
                 errors.append(f"UNKNOWN_FIELD:{field}")
     if enforce_auxiliary_field_roles:
         errors.extend(_auxiliary_primary_field_errors(text, auxiliary_fields))
+    errors.extend(_operator_arity_errors(text))
     errors.extend(_vector_reducer_arity_errors(text))
     if field_types:
         errors.extend(_vector_reducer_type_errors(text, field_types))
@@ -429,6 +435,22 @@ def _vector_reducer_arity_errors(text: str) -> List[str]:
             continue
         if len(args) != 1:
             errors.append(f"INVALID_VECTOR_REDUCER_ARITY:{operator}")
+    return list(dict.fromkeys(errors))
+
+
+def _operator_arity_errors(text: str) -> List[str]:
+    errors: List[str] = []
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        operator = match.group(1)
+        expected = EXACT_OPERATOR_ARITY.get(operator)
+        if expected is None:
+            continue
+        args = _function_arguments(text, match.end() - 1)
+        if args is None:
+            continue
+        actual = len(args)
+        if actual != expected:
+            errors.append(f"INVALID_OPERATOR_ARITY:{operator}:{actual}!={expected}")
     return list(dict.fromkeys(errors))
 
 

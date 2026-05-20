@@ -2592,7 +2592,7 @@ class BrainHTTPClient:
             if status in {"ERROR", "FAIL", "FAILED"}:
                 detail = data.get("detail") or data.get("message") or data.get("error") or data
                 raise RuntimeError(f"simulation failed on platform: {detail}")
-            alpha = data.get("alpha") or data.get("alphaId") or data.get("id")
+            alpha = data.get("alpha") or data.get("alphaId")
             if isinstance(alpha, dict):
                 alpha = alpha.get("id")
             if alpha:
