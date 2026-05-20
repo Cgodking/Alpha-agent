@@ -1045,6 +1045,62 @@ class WorkerTests(unittest.TestCase):
             metadata = json.loads(generated_event["metadata_json"])
             self.assertEqual(metadata["ai_metadata"]["validated_by"], "dp-pro-check")
 
+    def test_worker_falls_back_to_ai_when_setting_sweep_target_has_unknown_fields(self):
+        class CountingAI(LocalAIClient):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def generate_candidates(self, batch_size, context):
+                self.calls += 1
+                return [CandidateSpec("group_rank(ts_rank(mdl_mock_score,22),industry)")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            candidate_id = store.insert_candidate(
+                "rank(group_rank(ts_mean(unknown_alpha_field,30),industry))",
+                {"region": "USA", "delay": 0, "neutralization": "INDUSTRY"},
+                "openai_compatible",
+            )
+            store.update_candidate(
+                candidate_id,
+                metrics_json='{"sharpe":2.55,"fitness":1.32,"turnover":0.22,"drawdown":0.04}',
+                checks_json=json.dumps(
+                    {
+                        "LOW_SHARPE": {"status": "FAIL", "value": 2.55, "limit": 2.69},
+                        "LOW_FITNESS": {"status": "FAIL", "value": 1.32, "limit": 1.5},
+                        "LOW_TURNOVER": {"status": "PASS", "value": 0.22, "limit": 0.01},
+                        "HIGH_TURNOVER": {"status": "PASS", "value": 0.22, "limit": 0.7},
+                        "CONCENTRATED_WEIGHT": {"status": "PASS"},
+                        "LOW_SUB_UNIVERSE_SHARPE": {"status": "PASS", "value": 1.2, "limit": 1.0},
+                        "IS_LADDER_SHARPE": {"status": "PASS", "value": 2.7, "limit": 2.69},
+                        "SELF_CORRELATION": {"status": "PASS", "value": 0.2, "limit": 0.7},
+                        "PROD_CORRELATION": {"status": "PASS", "value": 0.1, "limit": 0.7},
+                        "DATA_DIVERSITY": {"status": "PASS"},
+                        "REGULAR_SUBMISSION": {"status": "PASS"},
+                    }
+                ),
+            )
+            store.transition(candidate_id, "check_pending", {"errors": ["SHARPE_BELOW_MIN:2.550<2.69"]})
+            ai = CountingAI()
+            worker = AlphaWorker(
+                store=store,
+                ai_client=ai,
+                brain_client=LocalBrainClient(),
+                policy=SubmissionPolicy(auto_submit=False),
+                batch_size=1,
+                context={"region": "USA", "universe": "TOP3000", "delay": 0, "neutralization": "INDUSTRY"},
+            )
+
+            summary = worker.run_once()
+
+            self.assertEqual(ai.calls, 1)
+            self.assertEqual(summary["generated"], 1)
+            self.assertTrue(
+                any(event["event_type"] == "setting_sweep_target_invalid" for event in store.events_for_candidate(None))
+            )
+
     def test_worker_falls_back_to_ai_when_setting_sweep_variants_are_exhausted(self):
         class CountingAI(LocalAIClient):
             def __init__(self):

@@ -1746,6 +1746,7 @@ class MultiModelAIClient:
         seen = set()
         seen_structures = set()
         structure_counts: Dict[str, int] = {}
+        overused_structure_keys = _overused_structure_keys(context)
         deduped: List[CandidateSpec] = []
         for candidate in candidates:
             key = re.sub(r"\s+", "", candidate.expression.lower())
@@ -1755,6 +1756,8 @@ class MultiModelAIClient:
             if reject_structural_duplicates and variant_key in seen_structures:
                 continue
             structure_key = expression_structure_key(candidate.expression)
+            if structure_key in overused_structure_keys:
+                continue
             if max_per_structure > 0 and int(structure_counts.get(structure_key, 0)) >= max_per_structure:
                 continue
             seen.add(key)
@@ -2273,6 +2276,29 @@ def _max_batch_candidates_per_structure(context: Dict[str, Any] | None) -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, value)
+
+
+def _overused_structure_keys(context: Dict[str, Any] | None) -> set[str]:
+    research_context = dict(context or {}).get("research_context")
+    if not isinstance(research_context, dict):
+        return set()
+    experiment_plan = research_context.get("experiment_plan") if isinstance(research_context.get("experiment_plan"), dict) else {}
+    mode = str(experiment_plan.get("mode") or "").lower()
+    if mode in {"optimize_best", "setting_sweep", "repair"}:
+        return set()
+    control = (
+        experiment_plan.get("structure_diversity_control")
+        if isinstance(experiment_plan.get("structure_diversity_control"), dict)
+        else {}
+    )
+    overused = control.get("overused_structures")
+    if not isinstance(overused, list):
+        return set()
+    return {
+        str(item.get("structure_key") or "").strip()
+        for item in overused
+        if isinstance(item, dict) and str(item.get("structure_key") or "").strip()
+    }
 
 
 def _client_profile_dict(client: Any) -> Dict[str, Any]:

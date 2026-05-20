@@ -506,6 +506,33 @@ class AlphaWorker:
         variants = plan.get("setting_variants")
         if not expression or not isinstance(variants, list):
             return None
+        validation_errors = _setting_sweep_target_validation_errors(expression, research_context)
+        if validation_errors:
+            self.store.record_event(
+                None,
+                "setting_sweep_target_invalid",
+                {
+                    "target_candidate_id": plan.get("target_candidate_id"),
+                    "optimization_anchor_id": plan.get("optimization_anchor_id"),
+                    "errors": validation_errors,
+                    "expression": expression,
+                },
+            )
+            plan["mode"] = "explore_new_family"
+            plan["target_candidate_id"] = None
+            plan["abandoned_target_id"] = plan.get("optimization_anchor_id")
+            plan["abandon_reason"] = "SETTING_SWEEP_TARGET_INVALID"
+            plan["target_expression"] = ""
+            plan["objective"] = (
+                "The planned setting sweep target contains fields or syntax that are not valid in the current "
+                "datafield catalog. Explore fresh valid expressions instead."
+            )
+            plan["keep"] = []
+            plan["change"] = ["switch field family", "use exact current datafield ids", "generate fresh formula structures"]
+            plan["avoid_expressions"] = [expression]
+            plan.pop("setting_variants", None)
+            self.store.record_event(None, "experiment_plan", plan)
+            return None
         candidates: List[CandidateSpec] = []
         skipped_duplicates = 0
         for variant in variants[: self.batch_size]:
@@ -748,6 +775,20 @@ def _source_uses_structural_dedup(source: Any) -> bool:
 
 def _candidate_has_simulated_history(candidate: Dict[str, Any]) -> bool:
     return str(candidate.get("status") or "") in {"approved", "submitted", "failed", "check_pending"}
+
+
+def _setting_sweep_target_validation_errors(expression: str, research_context: Dict[str, Any]) -> List[str]:
+    datafields = research_context.get("datafields") if isinstance(research_context.get("datafields"), dict) else {}
+    field_ids = datafields.get("field_ids")
+    if not isinstance(field_ids, list) or not field_ids:
+        return []
+    field_types = datafields.get("field_types") if isinstance(datafields.get("field_types"), dict) else {}
+    return validate_expression(
+        expression,
+        allowed_fields=field_ids,
+        field_types=field_types,
+        enforce_auxiliary_field_roles=True,
+    )
 
 
 def _candidate_matches_context(row: Dict[str, Any], context: Dict[str, Any]) -> bool:

@@ -173,13 +173,23 @@ def analyze_research_history(research_context: Dict[str, Any]) -> Dict[str, Any]
     history_memory = research_context.get("history_memory") if isinstance(research_context.get("history_memory"), dict) else {}
     mechanism_memory = _mechanism_memory_from_history(history_memory)
     scope_health = history_memory.get("scope_health") if isinstance(history_memory.get("scope_health"), dict) else {}
+    active_run_history = (
+        research_context.get("active_run_history_memory")
+        if isinstance(research_context.get("active_run_history_memory"), dict)
+        else {}
+    )
+    route_scope_health = (
+        active_run_history.get("scope_health")
+        if isinstance(active_run_history.get("scope_health"), dict)
+        else scope_health
+    )
     candidate_queue_counts = _candidate_queue_counts(research_context)
     quality_thresholds = _quality_thresholds(
         best or {},
         target_settings,
         {"observed_quality_thresholds": observed_quality_thresholds},
     )
-    route_efficiency = _route_efficiency(scope_health, candidate_queue_counts, quality_thresholds)
+    route_efficiency = _route_efficiency(route_scope_health, candidate_queue_counts, quality_thresholds)
     structure_diversity_control = _structure_diversity_control(candidates, history_memory)
 
     submitted_avoid_fields = _submitted_avoid_fields(research_context)
@@ -537,7 +547,8 @@ def _candidate_pool(research_context: Dict[str, Any], target_settings: Dict[str,
 
 
 def _candidate_queue_counts(research_context: Dict[str, Any]) -> Dict[str, int]:
-    queues = research_context.get("candidate_queues")
+    active_run_queues = research_context.get("active_run_candidate_queues")
+    queues = active_run_queues if isinstance(active_run_queues, dict) else research_context.get("candidate_queues")
     if not isinstance(queues, dict):
         return {}
     counts = queues.get("counts")

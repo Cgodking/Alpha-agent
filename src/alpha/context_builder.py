@@ -130,6 +130,22 @@ def build_ai_research_context(
         "reference_brain_project": reference_project,
     }
     context["candidate_queues"] = _candidate_queues(store, target_settings, history_limit)
+    active_run_started_at = _active_run_started_at(store, target_settings)
+    if active_run_started_at:
+        context["active_run_candidate_queues"] = _candidate_queues(
+            store,
+            target_settings,
+            history_limit,
+            created_since=active_run_started_at,
+        )
+        context["active_run_history_memory"] = _history_memory(
+            store,
+            target_settings,
+            _field_ids_from_catalog(field_catalog),
+            submitted_avoidance=context.get("submitted_field_avoidance"),
+            lit_tower_avoidance=context.get("lit_tower_avoidance"),
+            created_since=active_run_started_at,
+        )
     context["history_memory"] = _history_memory(
         store,
         target_settings,
@@ -942,6 +958,7 @@ def _history_memory(
     known_fields: List[str],
     submitted_avoidance: Dict[str, Any] | None = None,
     lit_tower_avoidance: Dict[str, Any] | None = None,
+    created_since: str | None = None,
 ) -> Dict[str, Any]:
     status_counts: Dict[str, int] = {}
     failure_reasons: Dict[str, int] = {}
@@ -967,7 +984,12 @@ def _history_memory(
         if str(family).strip()
     }
 
-    for candidate in store.list_recent_candidates(HISTORY_MEMORY_SCAN_LIMIT):
+    candidates = (
+        list(reversed(store.list_candidates(created_since=created_since)))
+        if created_since
+        else store.list_recent_candidates(HISTORY_MEMORY_SCAN_LIMIT)
+    )
+    for candidate in candidates:
         settings = _loads_json(candidate.get("settings_json"))
         if not _candidate_scope_matches(settings, target_settings):
             continue
@@ -1039,6 +1061,7 @@ def _history_memory(
             "use recent_* and candidate_queues only for fresh concrete examples."
         ),
         "scan_limit": HISTORY_MEMORY_SCAN_LIMIT,
+        "created_since": created_since,
         "scanned_candidates": scanned,
         "status_counts": status_counts,
         "top_fields": _top_memory_buckets(field_stats, 30),
@@ -1371,12 +1394,22 @@ def _failure_reason_names(store: AlphaStore, candidate_id: int, quality: Dict[st
     return ["UNKNOWN"]
 
 
-def _candidate_queues(store: AlphaStore, target_settings: Dict[str, Any], limit: int) -> Dict[str, Any]:
+def _candidate_queues(
+    store: AlphaStore,
+    target_settings: Dict[str, Any],
+    limit: int,
+    created_since: str | None = None,
+) -> Dict[str, Any]:
     queues: Dict[str, Any] = {name: [] for name in CANDIDATE_QUEUE_NAMES}
     abandoned_ids = _abandoned_candidate_ids(store, target_settings)
     inspected = 0
     max_inspected = max(RECENT_CONTEXT_SCAN_LIMIT, limit * 10)
-    for candidate in store.list_recent_candidates(max_inspected):
+    candidates = (
+        list(reversed(store.list_candidates(created_since=created_since)))
+        if created_since
+        else store.list_recent_candidates(max_inspected)
+    )
+    for candidate in candidates:
         settings = _loads_json(candidate.get("settings_json"))
         if not _candidate_scope_matches(settings, target_settings):
             continue
@@ -1397,7 +1430,20 @@ def _candidate_queues(store: AlphaStore, target_settings: Dict[str, Any], limit:
         queues[name] = sorted(queues[name], key=_candidate_queue_sort_key, reverse=True)
     queues["counts"] = {name: len(queues[name]) for name in CANDIDATE_QUEUE_NAMES}
     queues["counts"]["total"] = sum(int(queues["counts"][name]) for name in CANDIDATE_QUEUE_NAMES)
+    if created_since:
+        queues["created_since"] = created_since
     return queues
+
+
+def _active_run_started_at(store: AlphaStore, target_settings: Dict[str, Any]) -> str:
+    state = store.get_run_state("daemon")
+    started_at = str(state.get("started_at") or "").strip()
+    if not started_at:
+        return ""
+    scope = state.get("scope")
+    if isinstance(scope, dict) and not _candidate_scope_matches(scope, target_settings):
+        return ""
+    return started_at
 
 
 def _candidate_queue_item(store: AlphaStore, candidate: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:

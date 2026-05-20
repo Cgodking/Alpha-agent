@@ -1352,6 +1352,50 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(context["history_hygiene"]["suppressed_low_quality_failures"], 1)
         self.assertEqual(context["history_hygiene"]["low_quality_score_max"], 0.2)
 
+    def test_route_efficiency_uses_active_run_progress_not_old_submitable_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            settings = {"region": "MEA", "universe": "TOP300", "delay": 1, "neutralization": "MARKET"}
+            approved_id = store.insert_candidate("rank(old_good_signal)", settings, "model:G-1")
+            store.update_candidate(approved_id, metrics_json=json.dumps({"sharpe": 2.0, "fitness": 1.2}))
+            store.transition(approved_id, "approved")
+            with store.connection() as conn:
+                conn.execute(
+                    "UPDATE candidates SET created_at = ?, updated_at = ? WHERE id = ?",
+                    ("2026-05-19T00:00:00+00:00", "2026-05-19T00:00:00+00:00", approved_id),
+                )
+            store.set_run_state(
+                "daemon",
+                {
+                    "status": "stopped",
+                    "started_at": "2026-05-19T12:00:00+00:00",
+                    "scope": settings,
+                },
+            )
+            for idx in range(125):
+                candidate_id = store.insert_candidate(f"rank(dead_signal_{idx})", settings, "model:G-2")
+                store.update_candidate(
+                    candidate_id,
+                    metrics_json=json.dumps({"sharpe": 0.01, "fitness": 0.0}),
+                    checks_json=json.dumps({"LOW_SHARPE": {"status": "FAIL", "value": 0.01, "limit": 1.58}}),
+                )
+                store.transition(candidate_id, "failed", {"errors": ["LOW_SHARPE:FAIL"]})
+
+            context = build_ai_research_context(
+                store,
+                settings,
+                knowledge_dir=base / "missing-knowledge",
+                reference_dir=base / "missing-reference",
+                field_catalog={"available": True, "field_ids": [f"dead_signal_{idx}" for idx in range(125)], "fields": []},
+            )
+
+        self.assertEqual(context["candidate_queues"]["counts"]["submitable"], 1)
+        self.assertEqual(context["active_run_candidate_queues"]["counts"]["submitable"], 0)
+        self.assertEqual(context["analysis"]["route_efficiency"]["submitable_count"], 0)
+        self.assertTrue(context["analysis"]["route_efficiency"]["stop_loss_active"])
+
 
 if __name__ == "__main__":
     unittest.main()

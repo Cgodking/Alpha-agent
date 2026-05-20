@@ -744,6 +744,47 @@ class MultiModelTests(unittest.TestCase):
 
         self.assertEqual(len(candidates), 2)
 
+    def test_multi_model_client_rejects_overused_structures_in_exploration(self):
+        class MixedStructureGenerator:
+            profile_name = "G-1"
+            model = "gemini-3-flash-free"
+            role = "generator"
+
+            def generate_candidates(self, batch_size, context):
+                settings = {"region": "MEA", "delay": 1}
+                return [
+                    CandidateSpec(
+                        "group_rank(ts_rank(vec_avg(overused_signal),63),industry)",
+                        settings=settings,
+                        source="model:G-1",
+                    ),
+                    CandidateSpec(
+                        "rank(vec_avg(fresh_signal))",
+                        settings=settings,
+                        source="model:G-1",
+                    ),
+                ]
+
+        client = MultiModelAIClient(generators=[MixedStructureGenerator()])
+        context = {
+            "region": "MEA",
+            "delay": 1,
+            "research_context": {
+                "experiment_plan": {
+                    "mode": "explore_new_family",
+                    "structure_diversity_control": {
+                        "overused_structures": [
+                            {"structure_key": "group_rank(ts_rank(vec_avg(field),#),group:industry)"}
+                        ]
+                    },
+                },
+            },
+        }
+
+        candidates = client.generate_candidates(2, context)
+
+        self.assertEqual([candidate.expression for candidate in candidates], ["rank(vec_avg(fresh_signal))"])
+
     def test_multi_model_client_does_not_split_retry_nonrecoverable_model_errors(self):
         controller = FakeController({"mode": "explore", "allocation": {"minimax": 4}})
         minimax = FailingGenerator(
