@@ -679,7 +679,7 @@ def _allowed_fields_from_context(ai_context: Dict[str, Any]) -> List[str]:
     if not isinstance(research_context, dict):
         return []
     datafields = research_context.get("datafields")
-    if not isinstance(datafields, dict) or not datafields.get("available"):
+    if not isinstance(datafields, dict):
         return []
     field_ids = datafields.get("field_ids")
     return [str(field) for field in field_ids] if isinstance(field_ids, list) else []

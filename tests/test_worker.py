@@ -552,6 +552,40 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(candidate["status"], "failed")
             self.assertTrue(any("UNKNOWN_FIELD:ai_invented_field" in event["metadata_json"] for event in events))
 
+    def test_worker_rejects_ai_invented_field_when_datafield_discovery_fails(self):
+        class DiscoveryFailingBrain(LocalBrainClient):
+            def __init__(self):
+                super().__init__()
+                self.simulation_calls = 0
+
+            def discover_datafields(self, settings, search_terms=None, max_fields=120):
+                raise RuntimeError("datafield discovery unavailable")
+
+            def simulate(self, expression, settings):
+                self.simulation_calls += 1
+                return super().simulate(expression, settings)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            brain = DiscoveryFailingBrain()
+            worker = AlphaWorker(
+                store=store,
+                ai_client=LocalAIClient(expressions=["rank(ai_invented_field)"]),
+                brain_client=brain,
+                policy=SubmissionPolicy(auto_submit=False),
+                batch_size=1,
+            )
+
+            summary = worker.run_once()
+
+            candidate = store.list_candidates()[0]
+            events = store.events_for_candidate(candidate["id"])
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(brain.simulation_calls, 0)
+            self.assertEqual(candidate["status"], "failed")
+            self.assertTrue(any("UNKNOWN_FIELD:ai_invented_field" in event["metadata_json"] for event in events))
+
     def test_worker_rejects_vector_field_ts_backfill_before_simulation(self):
         class VectorFieldBrain(LocalBrainClient):
             def __init__(self):

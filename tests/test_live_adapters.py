@@ -439,6 +439,37 @@ class LiveAdapterTests(unittest.TestCase):
         searches = [call[2]["params"].get("search", "") for call in session.calls]
         self.assertIn("news", searches)
 
+    def test_brain_http_client_keeps_datafield_query_window_within_platform_cap(self):
+        class DuplicateHeavySession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                path = url.replace("https://api.worldquantbrain.com", "")
+                params = kwargs.get("params", {})
+                self.calls.append(("GET", path, kwargs))
+                offset = int(params.get("offset", 0))
+                limit = int(params.get("limit", 0))
+                if offset + limit > 100:
+                    return FakeResponse(400, ["Invalid query"], text='["Invalid query: maximum offset + limit for search query is 100."]')
+                if offset == 0:
+                    rows = [{"id": f"field_{idx}", "type": "MATRIX"} for idx in range(50)]
+                else:
+                    rows = [{"id": f"field_{idx}", "type": "MATRIX"} for idx in range(50)]
+                return FakeResponse(200, {"results": rows})
+
+        session = DuplicateHeavySession()
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        fields = client.discover_datafields(
+            {"region": "MEA", "universe": "TOP300", "delay": 1},
+            search_terms=["model"],
+            max_fields=120,
+        )
+
+        self.assertEqual(len(fields), 50)
+        self.assertTrue(all(call[2]["params"]["offset"] + call[2]["params"]["limit"] <= 100 for call in session.calls))
+
     def test_brain_http_client_loads_credentials_file_from_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             cred_path = Path(tmp) / "brain_credentials.txt"

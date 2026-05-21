@@ -2806,14 +2806,17 @@ class BrainHTTPClient:
         seen = set()
         terms = search_terms if search_terms is not None else [""]
         per_request_limit = min(50, max_fields)
-        per_term_limit = max_fields
+        platform_query_limit = 100
+        per_term_limit = min(max_fields, platform_query_limit)
         if search_terms is not None and len(terms) > 1:
-            per_term_limit = max(per_request_limit, (max_fields + len(terms) - 1) // len(terms))
+            per_term_limit = min(
+                platform_query_limit,
+                max(per_request_limit, (max_fields + len(terms) - 1) // len(terms)),
+            )
         for term in terms:
             offset = 0
-            term_added = 0
-            while len(rows) < max_fields and term_added < per_term_limit:
-                request_limit = min(per_request_limit, max_fields - len(rows), per_term_limit - term_added)
+            while len(rows) < max_fields and offset < per_term_limit:
+                request_limit = min(per_request_limit, max_fields - len(rows), per_term_limit - offset)
                 params = dict(scope)
                 params.update({"limit": request_limit, "offset": offset})
                 if term:
@@ -2833,7 +2836,6 @@ class BrainHTTPClient:
                         continue
                     seen.add(field_id)
                     rows.append(row)
-                    term_added += 1
                     if len(rows) >= max_fields:
                         break
                 if len(rows) >= max_fields:

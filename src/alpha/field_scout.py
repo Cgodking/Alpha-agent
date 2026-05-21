@@ -90,6 +90,11 @@ def _score_field(
     if explored_count > 0:
         failure_penalty = min(0.40, 0.40 * (failed_count / max(1, explored_count)))
     submitted_penalty = 0.45 if field_id in submitted_fields else 0.0
+    metadata_reason = _metadata_field_reason(field)
+    metadata_penalty = 0.55 if metadata_reason else 0.0
+    tower_status = "unlit" if category in unlit_categories else "lit" if category in lit_categories else "unknown"
+    lit_tower_penalty = 0.25 if tower_status == "lit" else 0.0
+    low_coverage_penalty = 0.20 if _float(field.get("coverage")) <= 0.0 else 0.0
     score = (
         coverage_score * 0.25
         + scarcity_score * 0.25
@@ -99,9 +104,11 @@ def _score_field(
         + history_score * 0.05
         - failure_penalty
         - submitted_penalty
+        - metadata_penalty
+        - lit_tower_penalty
+        - low_coverage_penalty
     )
-    primary_policy = "avoid_primary" if field_id in submitted_fields else "prefer_primary"
-    tower_status = "unlit" if category in unlit_categories else "lit" if category in lit_categories else "unknown"
+    primary_policy = "avoid_primary" if field_id in submitted_fields or metadata_reason or tower_status == "lit" else "prefer_primary"
     return {
         "field": field_id,
         "score": round(_clamp(score), 4),
@@ -118,6 +125,7 @@ def _score_field(
         "best_fitness": history.get("best_fitness"),
         "tower_status": tower_status,
         "primary_policy": primary_policy,
+        "metadata_reason": metadata_reason,
         "score_components": {
             "coverage": round(coverage_score, 4),
             "scarcity": round(scarcity_score, 4),
@@ -127,6 +135,9 @@ def _score_field(
             "history": round(history_score, 4),
             "failure_penalty": round(failure_penalty, 4),
             "submitted_penalty": round(submitted_penalty, 4),
+            "metadata_penalty": round(metadata_penalty, 4),
+            "lit_tower_penalty": round(lit_tower_penalty, 4),
+            "low_coverage_penalty": round(low_coverage_penalty, 4),
         },
     }
 
@@ -135,7 +146,9 @@ def _buckets(top_fields: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any
     bucket_specs = [
         (
             "high_opportunity_unexplored",
-            lambda row: int(row.get("explored_count", 0)) == 0 and row.get("primary_policy") != "avoid_primary",
+            lambda row: int(row.get("explored_count", 0)) == 0
+            and row.get("primary_policy") != "avoid_primary"
+            and row.get("tower_status") != "lit",
             "High opportunity fields not yet tested by this project.",
         ),
         (
@@ -200,8 +213,28 @@ def _tower_score(category: str, lit_categories: set[str], unlit_categories: set[
     return 0.5
 
 
+def _metadata_field_reason(field: Dict[str, Any]) -> str:
+    field_id = str(field.get("id") or "").lower()
+    description = str(field.get("description") or "").lower()
+    haystack = f"{field_id} {description}"
+    patterns = (
+        ("currency", ("currency", "_crncy", "fund_crncy")),
+        ("entry_date", ("entry date", "timestamp of entry", "data point was entered", "fundamental_entry_dt", "_entry_dt")),
+    )
+    for reason, needles in patterns:
+        if any(needle in haystack for needle in needles):
+            return reason
+    return ""
+
+
 def _category(value: Any) -> str:
-    return str(value or "").strip().upper().replace(" ", "")
+    normalized = str(value or "").strip().upper().replace("_", "").replace("-", "").replace(" ", "")
+    aliases = {
+        "PRICEVOLUME": "PV",
+        "PRICEVOLUMEDATA": "PV",
+        "PRICENVOLUME": "PV",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _inverse_count(value: Any) -> float:
