@@ -136,6 +136,28 @@ class AlphaWorker:
                     self._record_validator_rejections(summary)
                     break
                 except Exception as exc:
+                    non_retryable_reason = _non_retryable_ai_generation_error(exc)
+                    if non_retryable_reason:
+                        self._record_ai_client_diagnostics()
+                        self.log.error(
+                            "AI candidate generation blocked reason=%s attempt=%s error=%s",
+                            non_retryable_reason,
+                            attempt,
+                            exc,
+                        )
+                        self.store.record_event(
+                            None,
+                            "ai_generation_error",
+                            {
+                                "error": str(exc),
+                                "attempt": attempt,
+                                "non_retryable": True,
+                                "reason": non_retryable_reason,
+                            },
+                        )
+                        summary["failed"] += 1
+                        summary[non_retryable_reason] = 1
+                        return summary
                     self.log.exception("AI candidate generation failed attempt=%s", attempt)
                     self.store.record_event(None, "ai_generation_error", {"error": str(exc), "attempt": attempt})
         if candidates is None:
@@ -813,6 +835,25 @@ def _current_quarter_date_range(today: date | None = None) -> tuple[str, str]:
         next_quarter = date(current.year, start_month + 3, 1)
     end = next_quarter - timedelta(days=1)
     return start.isoformat(), end.isoformat()
+
+
+def _non_retryable_ai_generation_error(exc: Exception) -> str | None:
+    text = str(exc).lower()
+    quota_markers = (
+        "insufficient_user_quota",
+        "insufficient_quota",
+        "prepay",
+        "prepaid",
+        "预扣费额度失败",
+        "用户剩余额度",
+        "remaining balance",
+    )
+    if any(marker in text for marker in quota_markers):
+        return "ai_quota_blocked"
+    config_markers = ("invalid_api_key", "invalid api key", "unauthorized", "forbidden")
+    if any(marker in text for marker in config_markers):
+        return "ai_config_blocked"
+    return None
 
 
 def _scope_value(value: Any) -> str:

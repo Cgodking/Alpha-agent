@@ -227,6 +227,43 @@ class CliTests(unittest.TestCase):
         sleep.assert_not_called()
         self.assertIn("time_limit_reached", stdout.getvalue())
 
+    def test_cli_daemon_stops_when_ai_quota_is_blocked(self):
+        class FakeWorker:
+            def run_once(self):
+                calls.append("run_once")
+                return {"generated": 0, "failed": 1, "ai_quota_blocked": 1}
+
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "alpha.db"
+            env_path = self._local_env(tmp)
+            stdout = io.StringIO()
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("alpha.cli._worker", return_value=FakeWorker()),
+                patch("alpha.cli.time.sleep", side_effect=AssertionError("daemon should stop before sleeping")) as sleep,
+                redirect_stdout(stdout),
+            ):
+                exit_code = main(
+                    [
+                        "--env-file",
+                        str(env_path),
+                        "--db",
+                        str(db_path),
+                        "daemon",
+                        "--batch-size",
+                        "1",
+                        "--loop-seconds",
+                        "60",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["run_once"])
+        sleep.assert_not_called()
+        self.assertIn("ai_quota_blocked", stdout.getvalue())
+
     def test_cli_run_once_scope_args_normalize_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "alpha.db"

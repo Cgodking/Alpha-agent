@@ -161,6 +161,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 summary = _worker(store, cfg.batch_size, cfg.policy, cfg.ai_client, cfg.brain_client, cycle_context).run_once()
                 log.info("daemon_cycle summary=%s", summary)
                 print(summary, flush=True)
+                if summary.get("ai_quota_blocked") or summary.get("ai_config_blocked"):
+                    reason = "ai_quota_blocked" if summary.get("ai_quota_blocked") else "ai_config_blocked"
+                    _mark_daemon_stopped(store, reason)
+                    log.warning("daemon stopped reason=%s", reason)
+                    print(reason, flush=True)
+                    return 0
                 sleep_seconds = loop_seconds
                 if deadline is not None:
                     remaining = deadline - time.monotonic()

@@ -628,6 +628,41 @@ class AiIntegrationTests(unittest.TestCase):
             events = store.events_for_candidate(None)
             self.assertTrue(any(event["event_type"] == "ai_generation_error" for event in events))
 
+    def test_worker_does_not_retry_non_retryable_ai_quota_error(self):
+        class QuotaFailingAI:
+            def __init__(self):
+                self.calls = 0
+
+            def generate_candidates(self, batch_size, context):
+                self.calls += 1
+                raise AIClientError(
+                    'AI request failed: HTTP 403: {"error":{"message":"预扣费额度失败, 用户剩余额度: $0.001, '
+                    '需要预扣费额度: $0.029","code":"insufficient_user_quota"}}'
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            ai = QuotaFailingAI()
+            worker = AlphaWorker(
+                store=store,
+                ai_client=ai,
+                brain_client=LocalBrainClient(),
+                policy=SubmissionPolicy(auto_submit=False, max_retries=3),
+                batch_size=1,
+            )
+
+            summary = worker.run_once()
+
+            self.assertEqual(ai.calls, 1)
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(summary["ai_quota_blocked"], 1)
+            events = store.events_for_candidate(None)
+            generation_errors = [event for event in events if event["event_type"] == "ai_generation_error"]
+            self.assertEqual(len(generation_errors), 1)
+            metadata = json.loads(generation_errors[0]["metadata_json"])
+            self.assertTrue(metadata["non_retryable"])
+
     def test_worker_retries_ai_generation_before_success(self):
         class FlakyAI:
             def __init__(self):
