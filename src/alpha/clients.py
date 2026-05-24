@@ -2518,15 +2518,20 @@ class BrainHTTPClient:
         base_url: str = "https://api.worldquantbrain.com",
         max_poll_attempts: int = 5,
         sleep: Callable[[float], None] = time.sleep,
+        request_timeout: float = 60.0,
     ):
         self.session = session or self._default_session()
         self.base_url = base_url.rstrip("/")
         self.max_poll_attempts = max_poll_attempts
         self.sleep = sleep
+        self.request_timeout = max(1.0, float(request_timeout))
 
     @classmethod
     def from_env(cls) -> "BrainHTTPClient":
-        client = cls(base_url=os.environ.get("BRAIN_BASE_URL", "https://api.worldquantbrain.com"))
+        client = cls(
+            base_url=os.environ.get("BRAIN_BASE_URL", "https://api.worldquantbrain.com"),
+            request_timeout=float(os.environ.get("BRAIN_REQUEST_TIMEOUT_SECONDS", "60")),
+        )
         email, password = cls.credentials_from_env()
         if email and password:
             client.authenticate(email, password)
@@ -2560,19 +2565,34 @@ class BrainHTTPClient:
             raise RuntimeError("requests is required for BRAIN_CLIENT=http") from exc
         return requests.Session()
 
+    def _get(self, url: str, **kwargs: Any) -> Any:
+        return self._request("get", url, **kwargs)
+
+    def _post(self, url: str, **kwargs: Any) -> Any:
+        return self._request("post", url, **kwargs)
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        call = getattr(self.session, method)
+        try:
+            return call(url, timeout=self.request_timeout, **kwargs)
+        except TypeError as exc:
+            if "timeout" not in str(exc).lower():
+                raise
+            return call(url, **kwargs)
+
     def authenticate(self, email: str, password: str) -> None:
         try:
             from requests.auth import HTTPBasicAuth  # type: ignore
         except ImportError as exc:
             raise RuntimeError("requests is required for BRAIN authentication") from exc
         self.session.auth = HTTPBasicAuth(email, password)
-        response = self.session.post(f"{self.base_url}/authentication")
+        response = self._post(f"{self.base_url}/authentication")
         if response.status_code not in (200, 201):
             raise RuntimeError(f"BRAIN authentication failed: HTTP {response.status_code}")
 
     def simulate(self, expression: str, settings: Dict[str, Any]) -> SimulationResult:
         payload = {"type": "REGULAR", "settings": settings, "regular": expression}
-        response = self.session.post(f"{self.base_url}/simulations", json=payload)
+        response = self._post(f"{self.base_url}/simulations", json=payload)
         if response.status_code != 201 or "Location" not in response.headers:
             raise RuntimeError(f"simulation creation failed: HTTP {response.status_code} {response.text[:200]}")
 
@@ -2596,7 +2616,7 @@ class BrainHTTPClient:
             {"type": "REGULAR", "settings": settings, "regular": expression}
             for expression, settings in items
         ]
-        response = self.session.post(f"{self.base_url}/simulations", json=payload)
+        response = self._post(f"{self.base_url}/simulations", json=payload)
         if response.status_code != 201 or "Location" not in response.headers:
             raise RuntimeError(f"multisimulation creation failed: HTTP {response.status_code} {response.text[:200]}")
 
@@ -2637,7 +2657,7 @@ class BrainHTTPClient:
 
     def _poll_simulation_for_alpha(self, location: str) -> str:
         for _ in range(self.max_poll_attempts):
-            response = self.session.get(self._absolute(location))
+            response = self._get(self._absolute(location))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 self.sleep(float(retry_after))
@@ -2658,7 +2678,7 @@ class BrainHTTPClient:
     def _poll_multisimulation_for_children(self, location: str) -> List[str]:
         attempts = int(os.environ.get("BRAIN_MULTI_POLL_ATTEMPTS", "200"))
         for _ in range(attempts):
-            response = self.session.get(self._absolute(location))
+            response = self._get(self._absolute(location))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 self.sleep(float(retry_after))
@@ -2679,7 +2699,7 @@ class BrainHTTPClient:
     def get_alpha_detail(self, alpha_id: str) -> Dict[str, Any]:
         last_status = 0
         for attempt in range(1, self.max_poll_attempts + 1):
-            response = self.session.get(f"{self.base_url}/alphas/{alpha_id}")
+            response = self._get(f"{self.base_url}/alphas/{alpha_id}")
             last_status = int(response.status_code)
             if response.status_code == 200:
                 return response.json()
@@ -2693,7 +2713,7 @@ class BrainHTTPClient:
     def get_submission_check(self, alpha_id: str) -> Dict[str, Dict[str, Any]]:
         path = f"/alphas/{alpha_id}/check"
         try:
-            post = self.session.post(f"{self.base_url}{path}")
+            post = self._post(f"{self.base_url}{path}")
             retry_after = post.headers.get("Retry-After")
             if retry_after:
                 self.sleep(float(retry_after))
@@ -2701,7 +2721,7 @@ class BrainHTTPClient:
             pass
 
         for _ in range(self.max_poll_attempts):
-            response = self.session.get(f"{self.base_url}{path}")
+            response = self._get(f"{self.base_url}{path}")
             retry_after = response.headers.get("Retry-After")
             if retry_after:
                 self.sleep(float(retry_after))
@@ -2721,7 +2741,7 @@ class BrainHTTPClient:
         if dry_run:
             return SubmitResult(alpha_id=alpha_id, submitted=False, stage="DRY_RUN", message="auto_submit disabled")
 
-        response = self.session.post(f"{self.base_url}/alphas/{alpha_id}/submit")
+        response = self._post(f"{self.base_url}/alphas/{alpha_id}/submit")
         if response.status_code not in (200, 201, 204):
             return SubmitResult(alpha_id=alpha_id, submitted=False, stage="REJECTED", message=f"HTTP {response.status_code}")
 
@@ -2734,7 +2754,7 @@ class BrainHTTPClient:
         return SubmitResult(alpha_id=alpha_id, submitted=False, stage=stage or "UNKNOWN", message="platform did not verify OS")
 
     def count_submitted_alphas(self, start_date: str, end_date: str) -> int:
-        response = self.session.get(
+        response = self._get(
             f"{self.base_url}/users/self/alphas",
             params={
                 "stage": "OS",
@@ -2752,7 +2772,7 @@ class BrainHTTPClient:
         return len(data.get("results", [])) if isinstance(data, dict) else 0
 
     def recent_submitted_alphas(self, settings: Dict[str, Any] | None = None, limit: int = 50) -> List[Dict[str, Any]]:
-        response = self.session.get(
+        response = self._get(
             f"{self.base_url}/users/self/alphas",
             params={
                 "stage": "OS",
@@ -2772,7 +2792,7 @@ class BrainHTTPClient:
             params["startDate"] = start_date
         if end_date:
             params["endDate"] = end_date
-        response = self.session.get(f"{self.base_url}/users/self/activities/pyramid-alphas", params=params)
+        response = self._get(f"{self.base_url}/users/self/activities/pyramid-alphas", params=params)
         if response.status_code != 200:
             raise RuntimeError(f"pyramid alpha lookup failed: HTTP {response.status_code}")
         data = response.json()
@@ -2784,7 +2804,7 @@ class BrainHTTPClient:
         return data
 
     def get_pyramid_multipliers(self) -> Dict[str, Any]:
-        response = self.session.get(f"{self.base_url}/users/self/activities/pyramid-multipliers")
+        response = self._get(f"{self.base_url}/users/self/activities/pyramid-multipliers")
         if response.status_code != 200:
             raise RuntimeError(f"pyramid multiplier lookup failed: HTTP {response.status_code}")
         data = response.json()
@@ -2848,7 +2868,7 @@ class BrainHTTPClient:
     def _get_with_rate_limit_retry(self, url: str, params: Dict[str, Any]) -> Any:
         attempts = int(os.environ.get("BRAIN_DATAFIELD_RETRIES", "2")) + 1
         for attempt in range(attempts):
-            response = self.session.get(url, params=params)
+            response = self._get(url, params=params)
             if response.status_code != 429 or attempt == attempts - 1:
                 return response
             retry_after = response.headers.get("Retry-After")

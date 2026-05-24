@@ -480,6 +480,33 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(email, "user@example.com")
         self.assertEqual(password, "secret")
 
+    def test_brain_http_client_passes_request_timeout_to_session(self):
+        class TimeoutSession:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                self.calls.append(("get", url, kwargs))
+                return FakeResponse(200, {"results": []})
+
+        session = TimeoutSession()
+        client = BrainHTTPClient(session=session, request_timeout=7.5)
+
+        client.recent_submitted_alphas(limit=1)
+
+        self.assertEqual(session.calls[0][2]["timeout"], 7.5)
+
+    def test_brain_http_client_falls_back_when_fake_session_rejects_timeout(self):
+        class LegacySession:
+            def get(self, url, **kwargs):
+                if "timeout" in kwargs:
+                    raise TypeError("unexpected timeout")
+                return FakeResponse(200, {"results": []})
+
+        client = BrainHTTPClient(session=LegacySession(), request_timeout=7.5)
+
+        self.assertEqual(client.recent_submitted_alphas(limit=1), [])
+
 
 if __name__ == "__main__":
     unittest.main()

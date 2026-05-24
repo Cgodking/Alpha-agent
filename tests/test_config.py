@@ -46,6 +46,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.simulation_context["decay"], 6)
         self.assertEqual(cfg.simulation_context["truncation"], 0.03)
 
+    def test_config_reports_invalid_numeric_environment_value(self):
+        with patch.dict(os.environ, {"BATCH_SIZE": "not-a-number"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "BATCH_SIZE must be an integer"):
+                load_config()
+
+    def test_config_reads_brain_request_timeout(self):
+        with patch.dict(os.environ, {"BRAIN_REQUEST_TIMEOUT_SECONDS": "12.5"}, clear=False):
+            cfg = load_config()
+
+        self.assertEqual(cfg.brain_request_timeout_seconds, 12.5)
+
 
 if __name__ == "__main__":
     unittest.main()
