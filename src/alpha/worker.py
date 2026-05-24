@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 from datetime import date, timedelta
 from dataclasses import replace
@@ -38,6 +39,7 @@ class AlphaWorker:
         policy: SubmissionPolicy,
         batch_size: int = 4,
         context: Dict[str, Any] | None = None,
+        cycle_plan: Dict[str, Any] | None = None,
     ):
         self.store = store
         self.ai_client = ai_client
@@ -45,10 +47,51 @@ class AlphaWorker:
         self.policy = policy
         self.batch_size = batch_size
         self.context = context or {"region": "USA", "universe": "TOP3000", "delay": 1}
+        self.cycle_plan = dict(cycle_plan or {})
         self.log = logging.getLogger("alpha.worker")
 
-    def _build_ai_context(self) -> Dict[str, Any]:
+    def _active_cycle_plan(self, cycle_plan: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        if cycle_plan is not None:
+            return dict(cycle_plan)
+        return dict(self.cycle_plan)
+
+    def _record_cycle_outcome(self, cycle_plan: Dict[str, Any] | None, summary: Dict[str, int]) -> None:
+        active_cycle_plan = self._active_cycle_plan(cycle_plan)
+        if not active_cycle_plan:
+            return
+        self.store.record_event(
+            None,
+            "cycle_outcome",
+            {"cycle_plan": active_cycle_plan, "summary": dict(summary)},
+        )
+
+    def _build_cycle_ai_context(self, cycle_plan: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        active_cycle_plan = self._active_cycle_plan(cycle_plan)
+        build_context = self._build_ai_context
+        parameters = inspect.signature(build_context).parameters
+        accepts_cycle_plan = "cycle_plan" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        if active_cycle_plan and accepts_cycle_plan:
+            return build_context(cycle_plan=cycle_plan)
+
+        ai_context = build_context()
+        if not active_cycle_plan:
+            return ai_context
+
+        ai_context = dict(ai_context)
+        ai_context["cycle_plan"] = active_cycle_plan
+        research_context = ai_context.get("research_context")
+        if isinstance(research_context, dict):
+            research_context["cycle_plan"] = active_cycle_plan
+        self.store.record_event(None, "cycle_plan", active_cycle_plan)
+        return ai_context
+
+    def _build_ai_context(self, cycle_plan: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        active_cycle_plan = self._active_cycle_plan(cycle_plan)
         ai_context = dict(self.context)
+        if active_cycle_plan:
+            ai_context["cycle_plan"] = active_cycle_plan
         field_catalog = build_field_catalog(self.brain_client, self.context)
         if not field_catalog.get("available"):
             self.store.record_event(None, "datafield_discovery_warning", field_catalog)
@@ -63,6 +106,9 @@ class AlphaWorker:
             platform_pyramid_alphas=platform_pyramid_alphas,
             platform_pyramid_multipliers=platform_pyramid_multipliers,
         )
+        if active_cycle_plan:
+            ai_context["research_context"]["cycle_plan"] = active_cycle_plan
+            self.store.record_event(None, "cycle_plan", active_cycle_plan)
         experiment_plan = ai_context["research_context"].get("experiment_plan")
         if experiment_plan:
             self.store.record_event(None, "experiment_plan", experiment_plan)
@@ -110,12 +156,12 @@ class AlphaWorker:
             return {}
         return payload if isinstance(payload, dict) else {"pyramids": payload if isinstance(payload, list) else []}
 
-    def run_once(self) -> Dict[str, int]:
+    def run_once(self, cycle_plan: Dict[str, Any] | None = None) -> Dict[str, int]:
         self.log.info("worker cycle started batch_size=%s", self.batch_size)
         summary = {"generated": 0, "approved": 0, "submitted": 0, "failed": 0, "pending": 0, "skipped": 0}
         submitted_this_round = 0
         candidates = None
-        ai_context = self._build_ai_context()
+        ai_context = self._build_cycle_ai_context(cycle_plan=cycle_plan)
         effective_policy = self._policy_for_ai_context(ai_context)
         submitted_this_round = self._recheck_pending_candidates(
             ai_context,
@@ -157,11 +203,13 @@ class AlphaWorker:
                         )
                         summary["failed"] += 1
                         summary[non_retryable_reason] = 1
+                        self._record_cycle_outcome(cycle_plan, summary)
                         return summary
                     self.log.exception("AI candidate generation failed attempt=%s", attempt)
                     self.store.record_event(None, "ai_generation_error", {"error": str(exc), "attempt": attempt})
         if candidates is None:
             summary["failed"] += 1
+            self._record_cycle_outcome(cycle_plan, summary)
             return summary
 
         ready_for_simulation: List[Tuple[int, CandidateSpec]] = []
@@ -256,6 +304,7 @@ class AlphaWorker:
             )
 
         self.log.info("worker cycle finished summary=%s", summary)
+        self._record_cycle_outcome(cycle_plan, summary)
         return summary
 
     def _find_structural_duplicate(

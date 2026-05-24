@@ -1268,6 +1268,54 @@ class WorkerTests(unittest.TestCase):
             events = store.events_for_candidate(None)
             self.assertTrue(any(event["event_type"] == "duplicate_candidate_skipped" for event in events))
 
+    def test_worker_records_optional_cycle_plan_and_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            cycle_plan = {
+                "mode": "explore",
+                "scope": {"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+                "target_candidate_id": None,
+                "reason": "test_plan",
+            }
+            worker = AlphaWorker(
+                store=store,
+                ai_client=LocalAIClient(),
+                brain_client=LocalBrainClient(),
+                policy=SubmissionPolicy(auto_submit=False),
+                batch_size=1,
+                context={"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+                cycle_plan=cycle_plan,
+            )
+
+            summary = worker.run_once()
+
+            events = store.events_for_candidate(None)
+            event_types = [event["event_type"] for event in events]
+            self.assertIn("cycle_plan", event_types)
+            self.assertIn("cycle_outcome", event_types)
+            self.assertEqual(summary["generated"], 1)
+
+    def test_worker_run_once_accepts_call_level_cycle_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            worker = AlphaWorker(
+                store=store,
+                ai_client=LocalAIClient(),
+                brain_client=LocalBrainClient(),
+                policy=SubmissionPolicy(auto_submit=False),
+                batch_size=1,
+                context={"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+            )
+
+            worker.run_once(cycle_plan={"mode": "explore", "reason": "call_level"})
+
+            events = store.events_for_candidate(None)
+            cycle_events = [event for event in events if event["event_type"] == "cycle_plan"]
+            self.assertEqual(len(cycle_events), 1)
+            self.assertEqual(json.loads(cycle_events[0]["metadata_json"])["reason"], "call_level")
+
 
 if __name__ == "__main__":
     unittest.main()
