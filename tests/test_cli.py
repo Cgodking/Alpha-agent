@@ -408,6 +408,63 @@ class CliTests(unittest.TestCase):
             self.assertIn("field_ids:", output)
             self.assertIn("close", output)
 
+    def test_cli_plan_next_prints_scheduler_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "alpha.db"
+            env_path = self._local_env(tmp)
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(main(["--env-file", str(env_path), "--db", str(db_path), "init-db"]), 0)
+
+                with patch("builtins.print") as printed:
+                    exit_code = main(["--env-file", str(env_path), "--db", str(db_path), "plan-next"])
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(printed.call_args.args[0])
+            self.assertEqual(payload["mode"], "explore")
+            self.assertIn("reason", payload)
+
+    def test_cli_status_efficiency_prints_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "alpha.db"
+            env_path = self._local_env(tmp)
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(main(["--env-file", str(env_path), "--db", str(db_path), "init-db"]), 0)
+
+                with patch("builtins.print") as printed:
+                    exit_code = main(["--env-file", str(env_path), "--db", str(db_path), "status", "--efficiency"])
+
+            self.assertEqual(exit_code, 0)
+            output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+            self.assertIn("generated:", output)
+            self.assertIn("preflight_pass_rate:", output)
+
+    def test_cli_daemon_throughput_mode_passes_cycle_plan_to_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "alpha.db"
+            env_path = self._local_env(tmp)
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(main(["--env-file", str(env_path), "--db", str(db_path), "init-db"]), 0)
+
+                with patch("alpha.cli.time.sleep", side_effect=KeyboardInterrupt):
+                    exit_code = main(
+                        [
+                            "--env-file",
+                            str(env_path),
+                            "--db",
+                            str(db_path),
+                            "daemon",
+                            "--throughput-mode",
+                            "--batch-size",
+                            "1",
+                            "--loop-seconds",
+                            "1",
+                        ]
+                    )
+
+            self.assertEqual(exit_code, 0)
+            events = AlphaStore(db_path).events_for_candidate(None)
+            self.assertTrue(any(event["event_type"] == "cycle_plan" for event in events))
+
     def _latest_settings(self, db_path: Path) -> dict:
         with sqlite3.connect(db_path) as conn:
             row = conn.execute("SELECT settings_json FROM candidates ORDER BY id DESC LIMIT 1").fetchone()

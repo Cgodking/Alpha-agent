@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
@@ -15,8 +16,10 @@ from .field_catalog import build_field_catalog
 from .field_scout import build_field_scout
 from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX, prune_low_quality_history
 from .logging_utils import setup_logging
+from .metrics import compute_efficiency_metrics
 from .scopes import SCOPE_PRESETS, apply_scope, preset_rows
 from .scope_rotation import next_rotating_scope, parse_scope_json
+from .scheduler import build_cycle_plan
 from .submission import submit_approved_candidates
 from .worker import AlphaWorker
 
@@ -39,9 +42,11 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--loop-seconds", type=float, default=None)
     daemon.add_argument("--run-minutes", type=float, default=None, help="运行指定分钟数后自动停止")
     daemon.add_argument("--scope-json", default=None, help="daemon 轮换探索的 scope JSON 列表")
+    daemon.add_argument("--throughput-mode", action="store_true", help="使用 scheduler cycle_plan 提升个人研究吞吐")
     _add_scope_args(daemon)
 
-    sub.add_parser("status", help="打印候选状态统计")
+    status = sub.add_parser("status", help="打印候选状态统计")
+    status.add_argument("--efficiency", action="store_true", help="打印个人效率指标")
     prune = sub.add_parser("prune-history", help="归档并删除低质量失败探索记录")
     prune.add_argument("--quality-max", type=float, default=DEFAULT_LOW_QUALITY_SCORE_MAX)
     prune.add_argument("--limit", type=int, default=1000)
@@ -55,6 +60,9 @@ def _build_parser() -> argparse.ArgumentParser:
     fields = sub.add_parser("fields", help="打印指定 scope 的字段池")
     fields.add_argument("--limit", type=int, default=40)
     _add_scope_args(fields)
+    plan_next = sub.add_parser("plan-next", help="预览下一轮 throughput scheduler 计划")
+    plan_next.add_argument("--batch-size", type=int, default=None)
+    _add_scope_args(plan_next)
     web = sub.add_parser("web", help="启动本地 Web 控制台")
     web.add_argument("--host", default="0.0.0.0")
     web.add_argument("--port", type=int, default=8080)
@@ -157,8 +165,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print("time_limit_reached", flush=True)
                     return 0
                 cycle_context = next_rotating_scope(store, scope_rotation) if scope_rotation else simulation_context
+                cycle_plan = None
+                cycle_batch_size = cfg.batch_size
+                if getattr(args, "throughput_mode", False):
+                    cycle_plan = build_cycle_plan(store, cycle_context, batch_size=cfg.batch_size)
+                    cycle_context = dict(cycle_context)
+                    if isinstance(cycle_plan.get("scope"), dict):
+                        cycle_context.update(cycle_plan["scope"])
+                    budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+                    try:
+                        cycle_batch_size = int(budget.get("batch_size") or cfg.batch_size)
+                    except (TypeError, ValueError):
+                        cycle_batch_size = cfg.batch_size
+                    log.info("daemon_cycle_plan=%s", cycle_plan)
                 log.info("daemon_cycle simulation_context=%s", cycle_context)
-                summary = _worker(store, cfg.batch_size, cfg.policy, cfg.ai_client, cfg.brain_client, cycle_context).run_once()
+                worker = _worker(store, cycle_batch_size, cfg.policy, cfg.ai_client, cfg.brain_client, cycle_context)
+                summary = worker.run_once(cycle_plan=cycle_plan) if cycle_plan is not None else worker.run_once()
                 log.info("daemon_cycle summary=%s", summary)
                 print(summary, flush=True)
                 if summary.get("ai_quota_blocked") or summary.get("ai_config_blocked"):
@@ -183,6 +205,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("stopped")
             return 0
 
+    if args.command == "plan-next":
+        plan = build_cycle_plan(store, simulation_context, batch_size=cfg.batch_size)
+        log.info("plan_next=%s", plan)
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+
     if args.command == "status":
         counts = store.status_counts()
         log.info("status counts=%s", counts)
@@ -190,6 +218,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("no candidates")
         for status, count in counts.items():
             print(f"{status}: {count}")
+        if getattr(args, "efficiency", False):
+            metrics = compute_efficiency_metrics(store, simulation_context)
+            for key, value in metrics["totals"].items():
+                print(f"{key}: {value}")
+            for key, value in metrics["rates"].items():
+                print(f"{key}: {value:.6f}")
         return 0
 
     if args.command == "prune-history":
