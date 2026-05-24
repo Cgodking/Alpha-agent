@@ -695,6 +695,25 @@ class WebControlTests(unittest.TestCase):
         self.assertIn('id="efficiency_metrics"', HTML)
         self.assertIn('id="scheduler_plan"', HTML)
 
+    def test_control_service_status_includes_daemon_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            service = ControlService(
+                store=store,
+                db_path=store.path,
+                env_file=base / ".env",
+                log_file=base / "alpha.log",
+                daemon_stdout_log=base / "daemon.log",
+                web_log=base / "web.log",
+            )
+
+            status = service.status()
+
+            self.assertIn("health", status)
+            self.assertEqual(status["health"]["status"], "stopped")
+
 
 if __name__ == "__main__":
     unittest.main()

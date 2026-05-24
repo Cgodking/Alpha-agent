@@ -21,6 +21,7 @@ from .db import AlphaStore, utc_now
 from .env_file import load_env_file
 from .field_catalog import build_field_catalog
 from .field_scout import build_field_scout
+from .health import daemon_health
 from .metrics import compute_efficiency_metrics
 from .scopes import SCOPE_PRESETS, platform_scope_rows, preset_rows
 from .scheduler import build_cycle_plan
@@ -288,6 +289,7 @@ class ControlService:
             "daemon": state,
             "scope_rotation_state": rotation_state,
             "pid": pid if running else None,
+            "health": daemon_health(self.store),
             "counts": counts,
             "history_counts": history_counts,
             "model_scores": self._model_scores(created_since=run_started_at),
