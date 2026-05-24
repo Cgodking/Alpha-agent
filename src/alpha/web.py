@@ -21,7 +21,9 @@ from .db import AlphaStore, utc_now
 from .env_file import load_env_file
 from .field_catalog import build_field_catalog
 from .field_scout import build_field_scout
+from .metrics import compute_efficiency_metrics
 from .scopes import SCOPE_PRESETS, platform_scope_rows, preset_rows
+from .scheduler import build_cycle_plan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -271,6 +273,16 @@ class ControlService:
         history_counts = self.store.status_counts()
         counts = self.store.status_counts(created_since=run_started_at) if run_started_at else history_counts
         research = self._research_context(state)
+        active_scope = state.get("scope") if isinstance(state.get("scope"), dict) else {}
+        if not active_scope:
+            active_scope = research.get("target_settings") if isinstance(research.get("target_settings"), dict) else {}
+        active_scope = active_scope if isinstance(active_scope, dict) else {}
+        efficiency = compute_efficiency_metrics(self.store, active_scope, created_since=run_started_at or None)
+        scheduler_plan = build_cycle_plan(
+            self.store,
+            active_scope,
+            batch_size=int(state.get("batch_size") or MAX_WEB_BACKTEST_BATCH),
+        )
         payload = {
             "running": running,
             "daemon": state,
@@ -284,6 +296,9 @@ class ControlService:
             "research_plan": research.get("experiment_plan", {}),
             "research_analysis": research.get("analysis", {}),
             "candidate_queues": _compact_candidate_queues_for_status(research.get("candidate_queues", {})),
+            "efficiency": efficiency,
+            "scheduler_plan": scheduler_plan,
+            "cooldowns": scheduler_plan.get("constraints", {}),
             "logs": {
                 "alpha": str(self.log_file),
                 "daemon": str(self.daemon_stdout_log),
@@ -841,6 +856,14 @@ HTML = r"""<!doctype html>
         </table>
       </section>
       <section class="panel-gap">
+        <h2>Efficiency</h2>
+        <pre id="efficiency_metrics" class="small">--</pre>
+      </section>
+      <section class="panel-gap">
+        <h2>Scheduler</h2>
+        <pre id="scheduler_plan" class="small">--</pre>
+      </section>
+      <section class="panel-gap">
         <h2>本轮候选</h2>
         <table>
           <thead><tr><th>ID</th><th>Status</th><th>Model</th><th>Scope</th><th>Metrics</th><th>Expression</th></tr></thead>
@@ -1009,6 +1032,8 @@ HTML = r"""<!doctype html>
       $('plan_target').textContent = plan.target_candidate_id || '--';
       $('plan_keep').textContent = (plan.keep || []).slice(0, 5).join(', ') || '--';
       $('plan_avoid').textContent = (plan.avoid || []).slice(0, 5).join(', ') || '--';
+      $('efficiency_metrics').textContent = JSON.stringify(data.efficiency || {}, null, 2);
+      $('scheduler_plan').textContent = JSON.stringify(data.scheduler_plan || {}, null, 2);
       $('updated').textContent = data.updated_at || '--';
       const body = $('candidates');
       body.innerHTML = '';

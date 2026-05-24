@@ -663,6 +663,38 @@ class WebControlTests(unittest.TestCase):
             self.assertNotIn("generated_metadata", status["candidate_queues"]["watchlist"][0])
             self.assertEqual(status["candidate_queues"]["counts"]["watchlist"], 1)
 
+    def test_control_service_status_includes_efficiency_and_scheduler_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = AlphaStore(base / "alpha.db")
+            store.init()
+            candidate_id = store.insert_candidate(
+                "rank(close)",
+                {"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+                "local_ai",
+            )
+            store.transition(candidate_id, "approved")
+            service = ControlService(
+                store=store,
+                db_path=store.path,
+                env_file=base / ".env",
+                log_file=base / "alpha.log",
+                daemon_stdout_log=base / "daemon.log",
+                web_log=base / "web.log",
+            )
+
+            status = service.status()
+
+            self.assertIn("efficiency", status)
+            self.assertIn("scheduler_plan", status)
+            self.assertIn("cooldowns", status)
+            self.assertEqual(status["scheduler_plan"]["mode"], "setting_sweep")
+            self.assertIn("approved_per_100_simulations", status["efficiency"]["rates"])
+
+    def test_control_panel_exposes_efficiency_panel(self):
+        self.assertIn('id="efficiency_metrics"', HTML)
+        self.assertIn('id="scheduler_plan"', HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
