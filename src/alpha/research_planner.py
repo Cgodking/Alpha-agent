@@ -19,12 +19,16 @@ MIN_OPTIMIZATION_IMPROVEMENT = 1.20
 DEFAULT_REQUIRED_SHARPE = 1.58
 DEFAULT_REQUIRED_FITNESS = 1.0
 OPTIMIZE_SHARPE_RATIO = 0.50
-OPTIMIZE_FITNESS_RATIO = 0.25
+OPTIMIZE_FITNESS_RATIO = 0.50
 SETTING_SWEEP_SHARPE_RATIO = 0.85
 SETTING_SWEEP_FITNESS_RATIO = 0.75
 DEFAULT_OPTIMIZE_READINESS = 0.45
 DEFAULT_SETTING_SWEEP_READINESS = 0.80
 QUALITY_COMPONENT_CAP = 1.2
+OPTIMIZE_MAX_OPEN_QUALITY_GAPS = 2
+OPTIMIZE_MIN_KNOWN_QUALITY_CHECKS = 4
+OPTIMIZE_FALLBACK_SHARPE_FLOOR = 1.4
+OPTIMIZE_FALLBACK_FITNESS_FLOOR = 0.75
 SCOPE_TROUBLE_FAILURE_STREAK = 96
 SCOPE_TROUBLE_MIN_SCANNED = 120
 ROUTE_STOP_LOSS_MIN_SCANNED = 120
@@ -81,11 +85,47 @@ SETTING_SWEEP_BLOCKING_FAILURES = {
     "REGULAR_SUBMISSION",
     "D0_SUBMISSION",
 }
+OPTIMIZATION_QUALITY_CHECKS = {
+    "LOW_SHARPE",
+    "LOW_FITNESS",
+    "LOW_RETURNS",
+    "LOW_TURNOVER",
+    "HIGH_TURNOVER",
+    "CONCENTRATED_WEIGHT",
+    "IS_LADDER_SHARPE",
+    "LOW_2Y_SHARPE",
+    "LOW_SUB_UNIVERSE_SHARPE",
+    "LOW_ROBUST_UNIVERSE_SHARPE",
+    "ROBUST_UNIVERSE_RETENTION",
+    "HT_TURNOVER",
+    "HT_HIGH_TURNOVER_RETURNS_RATIO",
+    "HT_MAX_TRADE_TURNOVER",
+    "HT_MAX_POSITION_TURNOVER",
+    "INVESTABLE_HIGH_TURNOVER",
+}
+OPTIMIZATION_TERMINAL_BLOCKERS = MANDATORY_SUBMISSION_CHECKS | {
+    "D0_SUBMISSION",
+    "POWERPOOL_CORRELATION",
+}
 QUALITY_METRIC_REQUIREMENTS = {
     "required_sharpe": ("sharpe", "LOW_SHARPE"),
     "required_fitness": ("fitness", "LOW_FITNESS"),
     "required_returns": ("returns", "LOW_RETURNS"),
 }
+ACTIONABLE_FAILURE_PRIORITY = [
+    "INVALID_EVENT_INPUT_OPERATOR",
+    "INVALID_VECTOR_TS_OPERATOR",
+    "INVALID_OPERATOR_ARITY",
+    "TOO_MANY_OPERATORS",
+    "PROFILE_FORBIDDEN_FIELD_FAMILY",
+    "PROFILE_REQUIRED_FIELD_FAMILY",
+    "TURNOVER_ABOVE_MAX",
+    "HIGH_TURNOVER",
+    "HT_TURNOVER",
+    "HT_HIGH_TURNOVER_RETURNS_RATIO",
+    "CONCENTRATED_WEIGHT",
+    "LOW_TURNOVER",
+]
 THRESHOLD_COPY_KEYS = (
     "required_returns",
     "turnover_min",
@@ -269,11 +309,55 @@ def build_experiment_plan(
     quality_components = best.get("quality_components") if isinstance(best.get("quality_components"), dict) else {}
     readiness_score = _float(quality_components.get("readiness_score"))
     submission_score = _float(quality_components.get("submission_score"))
+    optimization_gap_summary = _optimization_gap_summary(best, quality_thresholds)
     scope_trouble = _scope_trouble_state(analysis, quality_thresholds)
     mechanism_transfer = _mechanism_transfer_plan(analysis, scope_trouble)
+    production_rescue = _production_rescue_policy(route_stop_loss, scope_trouble, target_settings)
+    hard_lit_tower_names = [] if production_rescue.get("active") else lit_tower_names
+    tower_objective = (
+        _production_rescue_objective(production_rescue, lit_tower_avoidance)
+        if production_rescue.get("active")
+        else _lit_tower_objective(lit_tower_avoidance)
+    )
+
+    def with_quality_budget(plan: Dict[str, Any]) -> Dict[str, Any]:
+        budget = _quality_budget_for_plan(
+            str(plan.get("mode") or ""),
+            int(plan.get("batch_size") or batch_size),
+            field_scout,
+            best,
+            production_rescue=production_rescue,
+            structure_diversity_control=structure_diversity_control,
+        )
+        plan["quality_budget"] = budget["quality_budget"]
+        plan["probe_recommendations"] = budget["probe_recommendations"]
+        plan_production_rescue = dict(production_rescue)
+        if (
+            plan_production_rescue.get("active")
+            and not budget["probe_recommendations"]
+            and not budget["quality_budget"].get("slots", {}).get("probe_new_fields")
+        ):
+            plan_production_rescue.update(
+                {
+                    "active": False,
+                    "reason": "no_safe_probe_recommendations",
+                    "previous_reason": production_rescue.get("reason"),
+                }
+            )
+            disabled_note = (
+                " Production rescue is disabled for this cycle because no safe probe field or template is "
+                "available; continue fresh exploration without production-rescue motifs."
+            )
+            objective = str(plan.get("objective") or "")
+            if tower_objective and tower_objective in objective:
+                plan["objective"] = objective.replace(tower_objective, _lit_tower_objective(lit_tower_avoidance) + disabled_note)
+            elif objective:
+                plan["objective"] = objective + disabled_note
+        plan["production_rescue"] = plan_production_rescue
+        return plan
 
     if scope_trouble.get("active") and mechanism_transfer:
-        return {
+        return with_quality_budget({
             "mode": "explore_new_family",
             "target_candidate_id": None,
             "target_expression": "",
@@ -284,7 +368,7 @@ def build_experiment_plan(
                 + _mechanism_transfer_objective(mechanism_transfer)
                 + _family_diversity_objective(family_diversity_control)
                 + _submitted_avoidance_objective(submitted_avoidance)
-                + _lit_tower_objective(lit_tower_avoidance)
+                + tower_objective
                 + _route_stop_loss_objective(route_stop_loss)
                 + _structure_diversity_objective(structure_diversity_control)
             ),
@@ -298,7 +382,7 @@ def build_experiment_plan(
             ],
             "avoid": _avoid_list(
                 failure_reasons,
-                lit_tower_names + submitted_avoid_fields + weak_fields + mechanism_transfer.get("forbidden_fields", []),
+                hard_lit_tower_names + submitted_avoid_fields + weak_fields + mechanism_transfer.get("forbidden_fields", []),
             ),
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
@@ -311,10 +395,11 @@ def build_experiment_plan(
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
-        }
+            "optimization_gap_summary": optimization_gap_summary,
+        })
 
     if best and optimization_state.get("limit_exhausted"):
-        return {
+        return with_quality_budget({
             "mode": "explore_new_family",
             "target_candidate_id": None,
             "target_expression": "",
@@ -324,7 +409,7 @@ def build_experiment_plan(
                 "The previous optimization target used three rounds without at least 20 percent score improvement. "
                 "Abandon that family and explore structurally different fields."
                 + _submitted_avoidance_objective(submitted_avoidance)
-                + _lit_tower_objective(lit_tower_avoidance)
+                + tower_objective
                 + _route_stop_loss_objective(route_stop_loss)
                 + _structure_diversity_objective(structure_diversity_control)
             ),
@@ -335,7 +420,7 @@ def build_experiment_plan(
                 "test simpler field-native mechanisms",
                 "replace overused formula skeletons",
             ],
-            "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields + list(best.get("fields") or [])),
+            "avoid": _avoid_list(failure_reasons, hard_lit_tower_names + submitted_avoid_fields + weak_fields + list(best.get("fields") or [])),
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
             "field_scout": field_scout_for_plan,
@@ -346,7 +431,8 @@ def build_experiment_plan(
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
-        }
+            "optimization_gap_summary": optimization_gap_summary,
+        })
 
     if (
         best
@@ -355,7 +441,7 @@ def build_experiment_plan(
         and not _has_setting_sweep_blockers(best)
     ):
         optimization = _next_optimization_fields(best, optimization_state, score)
-        return {
+        return with_quality_budget({
             "mode": "setting_sweep",
             "target_candidate_id": best.get("id"),
             "optimization_anchor_id": optimization["anchor_id"],
@@ -371,11 +457,11 @@ def build_experiment_plan(
                 "The expression is near submission thresholds. Keep the expression fixed and test settings "
                 "variants before spending more AI tokens on formula changes."
                 + _submitted_avoidance_objective(submitted_avoidance)
-                + _lit_tower_objective(lit_tower_avoidance)
+                + tower_objective
             ),
             "keep": [field for field in (promising_fields[:8] or best.get("fields", [])[:8]) if field not in submitted_avoid_fields],
             "change": ["neutralization", "decay", "truncation"],
-            "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields),
+            "avoid": _avoid_list(failure_reasons, hard_lit_tower_names + submitted_avoid_fields + weak_fields),
             "setting_variants": _setting_variants(target_settings, batch_size),
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
@@ -387,19 +473,16 @@ def build_experiment_plan(
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
-        }
+            "optimization_gap_summary": optimization_gap_summary,
+        })
 
     if (
         best
         and quality_thresholds.get("trusted")
-        and (
-            readiness_score >= _float(quality_thresholds.get("optimize_readiness"), DEFAULT_OPTIMIZE_READINESS)
-            or sharpe >= quality_thresholds["optimize_sharpe"]
-            or fitness >= quality_thresholds["optimize_fitness"]
-        )
+        and optimization_gap_summary.get("eligible")
     ):
         optimization = _next_optimization_fields(best, optimization_state, score)
-        return {
+        return with_quality_budget({
             "mode": "optimize_best",
             "target_candidate_id": best.get("id"),
             "optimization_anchor_id": optimization["anchor_id"],
@@ -416,7 +499,7 @@ def build_experiment_plan(
                 "Improve Sharpe, Fitness, and ladder robustness without drifting into an unrelated field family."
                 + _family_diversity_objective(family_diversity_control)
                 + _submitted_avoidance_objective(submitted_avoidance)
-                + _lit_tower_objective(lit_tower_avoidance)
+                + tower_objective
             ),
             "keep": _diversified_keep_fields(
                 best,
@@ -433,7 +516,7 @@ def build_experiment_plan(
                 "normalization by cap or volatility",
                 "one secondary confirmation leg",
             ],
-            "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields),
+            "avoid": _avoid_list(failure_reasons, hard_lit_tower_names + submitted_avoid_fields + weak_fields),
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
@@ -445,7 +528,8 @@ def build_experiment_plan(
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
-        }
+            "optimization_gap_summary": optimization_gap_summary,
+        })
 
     if analysis.get("candidate_count"):
         threshold_note = (
@@ -454,7 +538,22 @@ def build_experiment_plan(
             if not quality_thresholds.get("trusted")
             else ""
         )
-        return {
+        abandon_weak_anchor = _should_abandon_weak_anchor(scope_trouble, route_stop_loss, optimization_gap_summary)
+        keep_fields = (
+            []
+            if abandon_weak_anchor
+            else _diversified_keep_fields(
+                best,
+                analysis.get("field_stats") or {},
+                family_diversity_control,
+                submitted_avoid_fields,
+                5,
+            )
+        )
+        avoid_fields = hard_lit_tower_names + submitted_avoid_fields + weak_fields
+        if abandon_weak_anchor:
+            avoid_fields += [str(field) for field in best.get("fields") or []]
+        return with_quality_budget({
             "mode": "explore_new_family",
             "target_candidate_id": None,
             "target_expression": "",
@@ -464,24 +563,18 @@ def build_experiment_plan(
                 + threshold_note
                 + _family_diversity_objective(family_diversity_control)
                 + _submitted_avoidance_objective(submitted_avoidance)
-                + _lit_tower_objective(lit_tower_avoidance)
+                + tower_objective
                 + _route_stop_loss_objective(route_stop_loss)
                 + _structure_diversity_objective(structure_diversity_control)
             ),
-            "keep": _diversified_keep_fields(
-                best,
-                analysis.get("field_stats") or {},
-                family_diversity_control,
-                submitted_avoid_fields,
-                5,
-            ),
+            "keep": keep_fields,
             "change": [
                 "switch field family",
                 "test simpler field-native mechanisms",
                 "use one clear economic hypothesis per candidate",
                 "replace overused formula skeletons",
             ],
-            "avoid": _avoid_list(failure_reasons, lit_tower_names + submitted_avoid_fields + weak_fields),
+            "avoid": _avoid_list(failure_reasons, avoid_fields),
             "family_diversity_control": family_diversity_control,
             "submitted_field_avoidance": submitted_avoidance,
             "lit_tower_avoidance": lit_tower_avoidance,
@@ -493,22 +586,23 @@ def build_experiment_plan(
             "batch_size": int(batch_size),
             "target_settings": dict(target_settings),
             "quality_thresholds": quality_thresholds,
-        }
+            "optimization_gap_summary": optimization_gap_summary,
+        })
 
-    return {
+    return with_quality_budget({
         "mode": "explore",
         "target_candidate_id": None,
         "target_expression": "",
         "objective": (
             "No usable local evidence yet. Generate diverse research-grade candidates from verified fields."
-            + _lit_tower_objective(lit_tower_avoidance)
+            + tower_objective
             + _structure_diversity_objective(structure_diversity_control)
         ),
         "keep": [],
         "change": ["cover multiple field families", "use economically grounded windows", "avoid trivial price-volume ranks"],
         "avoid": _avoid_list(
             ["trivial price-volume-only formulas", "unverified fields", "unverified operators"],
-            lit_tower_names + submitted_avoid_fields,
+            hard_lit_tower_names + submitted_avoid_fields,
         ),
         "family_diversity_control": family_diversity_control,
         "submitted_field_avoidance": submitted_avoidance,
@@ -521,14 +615,331 @@ def build_experiment_plan(
         "batch_size": int(batch_size),
         "target_settings": dict(target_settings),
         "quality_thresholds": quality_thresholds,
+        "optimization_gap_summary": optimization_gap_summary,
+    })
+
+
+HIGH_TURNOVER_PROBE_CATEGORIES = {
+    "earnings",
+    "insiders",
+    "news",
+    "sentiment",
+    "shortinterest",
+    "short interest",
+    "socialmedia",
+    "social media",
+}
+
+HIGH_TURNOVER_PROBE_DATASET_PREFIXES = (
+    "earn",
+    "ern",
+    "insd",
+    "insider",
+    "news",
+    "nws",
+    "sentiment",
+    "snt",
+    "short",
+    "shrt",
+    "social",
+    "scl",
+)
+
+
+def _quality_budget_for_plan(
+    mode: str,
+    batch_size: int,
+    field_scout: Dict[str, Any],
+    best: Dict[str, Any],
+    production_rescue: Dict[str, Any] | None = None,
+    structure_diversity_control: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    batch = max(0, int(batch_size or 0))
+    rescue_active = bool(isinstance(production_rescue, dict) and production_rescue.get("active"))
+    rows = _quality_budget_field_rows(field_scout, include_lit=rescue_active)
+    exploit_fields = [row["field"] for row in rows if _field_has_positive_evidence(row)]
+    blocked_structure_keys = _overused_structure_keys(structure_diversity_control) if rescue_active else set()
+    probe_rows = [
+        row
+        for row in rows
+        if row.get("field") not in set(exploit_fields)
+        and _field_is_probe_worthy(row, include_lit=rescue_active)
+        and (not rescue_active or _field_is_production_rescue_probe_candidate(row))
+    ]
+    probe_recommendations = []
+    for row in probe_rows[: max(2, batch)]:
+        recommendation = _probe_recommendation(
+            row,
+            production_rescue=rescue_active,
+            blocked_structure_keys=blocked_structure_keys,
+        )
+        if recommendation.get("templates"):
+            probe_recommendations.append(recommendation)
+    total_probe_templates = sum(
+        len(recommendation.get("templates") or [])
+        for recommendation in probe_recommendations
+        if isinstance(recommendation, dict)
+    )
+
+    if rescue_active:
+        if probe_recommendations:
+            probe_slots = min(batch, total_probe_templates)
+            if not exploit_fields:
+                probe_slots = min(probe_slots, 2)
+            slots = {"probe_new_fields": probe_slots}
+        else:
+            slots = {"broad_explore": batch}
+        rationale = (
+            "Production rescue is active after repeated low-quality scoped batches; use a small probe batch until "
+            "a field or structure earns optimize-ready evidence."
+            if probe_recommendations
+            else "Production rescue has no safe probe field or template; disable the rescue gate and continue fresh exploration."
+        )
+    elif mode == "setting_sweep":
+        slots = {"setting_sweep": batch}
+        rationale = "Candidate is close enough for settings-first testing; do not dilute the batch with fresh fields."
+    elif mode == "optimize_best":
+        probe_slots = min(1, len(probe_recommendations), max(0, batch - 2))
+        broad_slots = 1 if batch - probe_slots > 2 else 0
+        slots = {
+            "optimize_anchor": max(0, batch - probe_slots - broad_slots),
+            "probe_new_fields": probe_slots,
+            "broad_explore": broad_slots,
+        }
+        rationale = "Keep most slots on the near-threshold anchor while reserving a small probe lane."
+    elif exploit_fields:
+        probe_slots = min(2, len(probe_recommendations), max(0, batch - 2))
+        broad_slots = 1 if batch - probe_slots > 1 else 0
+        slots = {
+            "exploit_positive_evidence": max(0, batch - probe_slots - broad_slots),
+            "probe_new_fields": probe_slots,
+            "broad_explore": broad_slots,
+        }
+        rationale = "Spend most slots on fields with positive local evidence, then probe a small number of fresh fields."
+    elif not probe_recommendations:
+        slots = {"broad_explore": batch}
+        rationale = "No safe probe fields are currently available; avoid impossible probe allocation."
+    else:
+        slots = {"broad_explore": batch}
+        rationale = (
+            "No positive field evidence is available; pass fresh-field probe recommendations to the AI as "
+            "research guidance without spending normal explore slots on automatic probe simulations."
+        )
+
+    return {
+        "quality_budget": {
+            "priority": "production_first",
+            "batch_size": batch,
+            "slots": slots,
+            "exploit_fields": exploit_fields[: max(1, batch)],
+            "policy": (
+                "Field diversity and unlit towers are tie-breakers after quality. Do not spend all slots on one "
+                "dataset, one field family, or raw high-turnover alternative signals."
+            ),
+            "rationale": rationale,
+        },
+        "probe_recommendations": probe_recommendations,
     }
+
+
+def _quality_budget_field_rows(field_scout: Dict[str, Any], include_lit: bool = False) -> List[Dict[str, Any]]:
+    if not isinstance(field_scout, dict):
+        return []
+    rows = field_scout.get("top_fields") if include_lit else field_scout.get("top_primary_fields")
+    if not isinstance(rows, list):
+        rows = field_scout.get("top_primary_fields") if include_lit else field_scout.get("top_fields")
+    if not isinstance(rows, list):
+        return []
+    result = [row for row in rows if isinstance(row, dict) and str(row.get("field") or "").strip()]
+    result.sort(
+        key=lambda row: (
+            0 if _field_has_positive_evidence(row) else 1,
+            0 if row.get("primary_policy") == "prefer_primary" else 1,
+            1 if include_lit and str(row.get("tower_status") or "").strip().lower() == "lit" else 0,
+            _production_rescue_field_priority(row) if include_lit else 0,
+            int(row.get("explored_count") or 0),
+            -_float(row.get("score")),
+            str(row.get("field") or ""),
+        )
+    )
+    return result
+
+
+def _production_rescue_field_priority(row: Dict[str, Any]) -> int:
+    category = str(row.get("category") or "").strip().upper()
+    dataset_id = str(row.get("dataset_id") or row.get("datasetId") or "").strip().lower()
+    field = str(row.get("field") or "").strip().lower()
+    text = f"{category} {dataset_id} {field}"
+    if category == "OTHER" or dataset_id.startswith("oth") or "other" in text:
+        return 0
+    if category in {"FUNDAMENTAL", "FUNDAMENTALS"} or dataset_id.startswith("fnd"):
+        return 1
+    if category == "OPTION" or "option" in text:
+        return 2
+    if category == "ANALYST" or dataset_id.startswith("anl"):
+        return 3
+    if category in {"NEWS", "SENTIMENT"} or dataset_id.startswith(("nws", "snt")):
+        return 4
+    if category == "MODEL" or dataset_id.startswith("mdl") or "model" in text:
+        return 8
+    if category == "PV" or "price" in text or "volume" in text:
+        return 9
+    return 5
+
+
+def _field_is_production_rescue_probe_candidate(row: Dict[str, Any]) -> bool:
+    if _field_has_positive_evidence(row):
+        return True
+    return not _field_is_default_saturated_probe_category(row)
+
+
+def _field_is_default_saturated_probe_category(row: Dict[str, Any]) -> bool:
+    category = str(row.get("category") or "").strip().upper()
+    dataset_id = str(row.get("dataset_id") or row.get("datasetId") or "").strip().lower()
+    field = str(row.get("field") or "").strip().lower()
+    text = f"{category} {dataset_id} {field}"
+    return (
+        category == "MODEL"
+        or category == "PV"
+        or category == "PRICE VOLUME"
+        or dataset_id.startswith(("mdl", "pv"))
+        or "model" in text
+        or "price volume" in text
+    )
+
+
+def _field_has_positive_evidence(row: Dict[str, Any]) -> bool:
+    if int(row.get("explored_count") or 0) <= 0:
+        return False
+    return max(_float(row.get("best_sharpe")), _float(row.get("avg_sharpe"))) >= 1.0 or max(
+        _float(row.get("best_fitness")), _float(row.get("avg_fitness"))
+    ) >= 0.35
+
+
+def _field_is_probe_worthy(row: Dict[str, Any], include_lit: bool = False) -> bool:
+    if include_lit and _field_is_event_input_restricted(row):
+        return False
+    lit_soft_allowed = (
+        include_lit
+        and str(row.get("tower_status") or "").strip().lower() == "lit"
+        and not row.get("field_reason")
+        and not row.get("dataset_reason")
+        and not row.get("metadata_reason")
+    )
+    if row.get("primary_policy") == "avoid_primary" and not lit_soft_allowed:
+        return False
+    if row.get("field_reason") or row.get("dataset_reason") or row.get("metadata_reason"):
+        return False
+    failure_rate = _float(row.get("failed_count")) / max(1.0, _float(row.get("explored_count")))
+    dataset_failure_rate = _float(row.get("dataset_failed_count")) / max(1.0, _float(row.get("dataset_count")))
+    if int(row.get("explored_count") or 0) >= 2 and failure_rate >= 0.75 and not _field_has_positive_evidence(row):
+        return False
+    if int(row.get("dataset_count") or 0) >= 5 and dataset_failure_rate >= 0.75 and not _field_has_positive_evidence(row):
+        return False
+    return True
+
+
+def _field_is_event_input_restricted(row: Dict[str, Any]) -> bool:
+    category = str(row.get("category") or "").strip().lower()
+    dataset_id = str(row.get("dataset_id") or row.get("datasetId") or "").strip().lower()
+    dataset_name = str(row.get("dataset_name") or row.get("datasetName") or "").strip().lower()
+    field = str(row.get("field") or "").strip().lower()
+    return (
+        "news" in category
+        or "event" in category
+        or dataset_id.startswith(("news", "nws"))
+        or "news" in dataset_name
+        or "event" in dataset_name
+        or field.startswith(("news", "nws"))
+    )
+
+
+def _overused_structure_keys(structure_diversity_control: Dict[str, Any] | None) -> set[str]:
+    if not isinstance(structure_diversity_control, dict):
+        return set()
+    rows = structure_diversity_control.get("overused_structures")
+    if not isinstance(rows, list):
+        return set()
+    result: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("structure_key") or "").strip()
+        if key:
+            result.add(key)
+    return result
+
+
+def _probe_recommendation(
+    row: Dict[str, Any],
+    production_rescue: bool = False,
+    blocked_structure_keys: set[str] | None = None,
+) -> Dict[str, Any]:
+    field = str(row.get("field") or "").strip()
+    field_type = str(row.get("type") or "").upper()
+    value = f"vec_avg({field})" if field_type == "VECTOR" else field
+    stable_required = _field_needs_stabilized_probe(row)
+    stable_value = f"winsorize(ts_backfill({value}, 120), std=4)"
+    if production_rescue or stable_required:
+        stabilizing_templates = [
+            f"group_rank(ts_rank({stable_value}, 63), industry)",
+            f"group_rank(ts_rank(divide({stable_value}, cap), 63), industry)",
+            f"rank(ts_decay_linear(ts_backfill({value}, 120), 20))",
+            f"rank(multiply(-1, ts_rank({stable_value}, 33)))",
+        ]
+    else:
+        stabilizing_templates = [
+            f"rank(ts_mean({value}, 20))",
+            f"rank(ts_rank({value}, 60))",
+            f"group_rank(ts_mean({value}, 60), industry)",
+            f"rank(multiply(-1, ts_mean({value}, 20)))",
+            f"rank(ts_decay_linear({value}, 20))",
+        ]
+    if production_rescue and blocked_structure_keys:
+        stabilizing_templates = [
+            template
+            for template in stabilizing_templates
+            if expression_structure_key(template) not in blocked_structure_keys
+        ]
+    return {
+        "field": field,
+        "type": row.get("type"),
+        "dataset_id": row.get("dataset_id"),
+        "category": row.get("category"),
+        "score": row.get("score"),
+        "route": "production_rescue_probe" if production_rescue else "standardized_probe",
+        "stabilization_required": stable_required,
+        "templates": stabilizing_templates[:4] if stable_required else stabilizing_templates[:3],
+        "rationale": (
+            "Probe direction and smoothing before scale-up; treat unlit tower status as a bonus only after basic "
+            "quality and turnover behavior are measured."
+        ),
+    }
+
+
+def _field_needs_stabilized_probe(row: Dict[str, Any]) -> bool:
+    category = str(row.get("category") or "").strip().lower()
+    dataset_id = str(row.get("dataset_id") or row.get("datasetId") or "").strip().lower()
+    dataset_name = str(row.get("dataset_name") or row.get("datasetName") or "").strip().lower()
+    return (
+        category in HIGH_TURNOVER_PROBE_CATEGORIES
+        or dataset_id.startswith(HIGH_TURNOVER_PROBE_DATASET_PREFIXES)
+        or dataset_name.startswith(HIGH_TURNOVER_PROBE_DATASET_PREFIXES)
+    )
 
 
 def _compact_field_scout_for_plan(field_scout: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(field_scout, dict):
         return {}
     compact: Dict[str, Any] = {}
-    for key in ("active", "policy", "scoring"):
+    for key in (
+        "active",
+        "status",
+        "top_field_count",
+        "top_primary_field_count",
+        "policy",
+        "scoring",
+    ):
         if key in field_scout:
             compact[key] = field_scout[key]
     top_fields = field_scout.get("top_fields")
@@ -545,12 +956,48 @@ def _compact_field_scout_for_plan(field_scout: Dict[str, Any]) -> Dict[str, Any]
             "pyramidMultiplier",
             "explored_count",
             "failed_count",
+            "dataset_count",
+            "dataset_failed_count",
+            "best_sharpe",
+            "best_fitness",
+            "field_reason",
+            "dataset_reason",
             "tower_status",
             "primary_policy",
+            "usage_constraints",
         )
         compact["top_fields"] = [
             {key: row.get(key) for key in keep_keys if key in row}
             for row in top_fields[:30]
+            if isinstance(row, dict)
+        ]
+    top_primary_fields = field_scout.get("top_primary_fields")
+    if isinstance(top_primary_fields, list):
+        keep_keys = (
+            "field",
+            "score",
+            "type",
+            "dataset_id",
+            "category",
+            "coverage",
+            "userCount",
+            "alphaCount",
+            "pyramidMultiplier",
+            "explored_count",
+            "failed_count",
+            "dataset_count",
+            "dataset_failed_count",
+            "best_sharpe",
+            "best_fitness",
+            "field_reason",
+            "dataset_reason",
+            "tower_status",
+            "primary_policy",
+            "usage_constraints",
+        )
+        compact["top_primary_fields"] = [
+            {key: row.get(key) for key in keep_keys if key in row}
+            for row in top_primary_fields[:30]
             if isinstance(row, dict)
         ]
     buckets = field_scout.get("buckets")
@@ -736,6 +1183,115 @@ def _next_optimization_fields(best: Dict[str, Any], state: Dict[str, Any], score
     }
 
 
+def _optimization_gap_summary(best: Dict[str, Any], quality_thresholds: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = best.get("metrics") if isinstance(best.get("metrics"), dict) else {}
+    if not metrics and ("sharpe" in best or "fitness" in best):
+        metrics = best
+    checks = _candidate_checks(best, metrics)
+    components = best.get("quality_components") if isinstance(best.get("quality_components"), dict) else {}
+
+    known_quality_checks: set[str] = set()
+    open_quality_gaps: set[str] = set()
+    terminal_blockers: set[str] = set()
+    pending_quality_checks: set[str] = set()
+
+    def add_status(raw_name: Any, raw_status: Any) -> None:
+        name = _canonical_check_name(raw_name)
+        status = str(raw_status or "").strip().upper()
+        if not name:
+            return
+        if name in OPTIMIZATION_TERMINAL_BLOCKERS and status in {"FAIL", "WARNING"}:
+            terminal_blockers.add(name)
+        if name not in OPTIMIZATION_QUALITY_CHECKS:
+            return
+        known_quality_checks.add(name)
+        if status in {"FAIL", "WARNING"}:
+            open_quality_gaps.add(name)
+        elif status == "PENDING":
+            pending_quality_checks.add(name)
+
+    for raw_name, data in _iter_checks(checks):
+        add_status(raw_name, data.get("status", data.get("result")))
+
+    for raw_name in components.get("failed_checks") or []:
+        add_status(raw_name, "FAIL")
+    for raw_name in components.get("warning_checks") or []:
+        add_status(raw_name, "WARNING")
+    for raw_name in components.get("pending_checks") or []:
+        add_status(raw_name, "PENDING")
+    for raw_name in components.get("passed_checks") or []:
+        add_status(raw_name, "PASS")
+
+    def add_metric_min_gap(check_name: str, metric_key: str, threshold_key: str) -> None:
+        if check_name in known_quality_checks:
+            return
+        if metric_key not in metrics:
+            return
+        threshold = _positive_float(quality_thresholds.get(threshold_key))
+        if not threshold:
+            return
+        known_quality_checks.add(check_name)
+        if _float(metrics.get(metric_key), default=float("nan")) < threshold:
+            open_quality_gaps.add(check_name)
+
+    add_metric_min_gap("LOW_SHARPE", "sharpe", "required_sharpe")
+    add_metric_min_gap("LOW_FITNESS", "fitness", "required_fitness")
+    add_metric_min_gap("LOW_RETURNS", "returns", "required_returns")
+
+    turnover = _float(metrics.get("turnover"), default=float("nan"))
+    if turnover == turnover:
+        turnover_min = _positive_float(quality_thresholds.get("turnover_min"))
+        turnover_max = _positive_float(quality_thresholds.get("turnover_max"))
+        if turnover_min and "LOW_TURNOVER" not in known_quality_checks:
+            known_quality_checks.add("LOW_TURNOVER")
+            if turnover < turnover_min:
+                open_quality_gaps.add("LOW_TURNOVER")
+        if turnover_max and "HIGH_TURNOVER" not in known_quality_checks:
+            known_quality_checks.add("HIGH_TURNOVER")
+            if turnover > turnover_max:
+                open_quality_gaps.add("HIGH_TURNOVER")
+
+    required_sharpe = _positive_float(quality_thresholds.get("required_sharpe"))
+    required_fitness = _positive_float(quality_thresholds.get("required_fitness"))
+    sharpe_floor = max(OPTIMIZE_FALLBACK_SHARPE_FLOOR, required_sharpe * 0.65) if required_sharpe else OPTIMIZE_FALLBACK_SHARPE_FLOOR
+    fitness_floor = max(OPTIMIZE_FALLBACK_FITNESS_FLOOR, required_fitness * 0.50) if required_fitness else OPTIMIZE_FALLBACK_FITNESS_FLOOR
+    sharpe = _float(metrics.get("sharpe"))
+    fitness = _float(metrics.get("fitness"))
+    close_metric_fallback = sharpe >= sharpe_floor or fitness >= fitness_floor
+    enough_check_coverage = len(known_quality_checks) >= OPTIMIZE_MIN_KNOWN_QUALITY_CHECKS
+    open_gap_count = len(open_quality_gaps)
+    eligible = (
+        bool(open_quality_gaps)
+        and open_gap_count <= OPTIMIZE_MAX_OPEN_QUALITY_GAPS
+        and not terminal_blockers
+        and (enough_check_coverage or close_metric_fallback)
+    )
+
+    reason = "eligible_one_or_two_quality_gaps" if eligible else "not_near_enough_for_formula_optimization"
+    if terminal_blockers:
+        reason = "terminal_blocker_failed"
+    elif not open_quality_gaps:
+        reason = "no_open_quality_gap"
+    elif open_gap_count > OPTIMIZE_MAX_OPEN_QUALITY_GAPS:
+        reason = "too_many_quality_gaps"
+    elif not enough_check_coverage and not close_metric_fallback:
+        reason = "insufficient_check_coverage_and_not_close"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "open_quality_gap_count": open_gap_count,
+        "open_quality_gaps": sorted(open_quality_gaps),
+        "known_quality_check_count": len(known_quality_checks),
+        "known_quality_checks": sorted(known_quality_checks),
+        "pending_quality_checks": sorted(pending_quality_checks),
+        "terminal_blockers": sorted(terminal_blockers),
+        "close_metric_fallback": close_metric_fallback,
+        "sharpe_floor": round(sharpe_floor, 6),
+        "fitness_floor": round(fitness_floor, 6),
+    }
+
+
 def _best_candidate(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     scored = []
     preferred = [candidate for candidate in candidates if str(candidate.get("status") or "") != "failed"]
@@ -775,6 +1331,13 @@ def _candidate_score(candidate: Dict[str, Any]) -> float:
 
 def candidate_quality_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return _candidate_score_details(candidate)
+
+
+def candidate_optimization_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+    checks = _candidate_checks(candidate, metrics)
+    thresholds = _candidate_quality_thresholds(candidate, checks)
+    return _optimization_gap_summary(candidate, thresholds)
 
 
 def _candidate_score_details(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -1492,6 +2055,22 @@ def _diversified_keep_fields(
     return keep
 
 
+def _should_abandon_weak_anchor(
+    scope_trouble: Dict[str, Any],
+    route_stop_loss: Dict[str, Any],
+    optimization_gap_summary: Dict[str, Any],
+) -> bool:
+    if scope_trouble.get("active") or route_stop_loss.get("stop_loss_active"):
+        return True
+    if optimization_gap_summary.get("eligible"):
+        return False
+    return str(optimization_gap_summary.get("reason") or "") in {
+        "too_many_quality_gaps",
+        "terminal_blocker_failed",
+        "insufficient_check_coverage_and_not_close",
+    }
+
+
 def _submitted_avoidance_objective(submitted_avoidance: Dict[str, Any]) -> str:
     fields = [str(field) for field in submitted_avoidance.get("fields") or [] if str(field).strip()]
     if not fields:
@@ -1526,7 +2105,6 @@ def _mechanism_memory_from_history(history_memory: Dict[str, Any]) -> Dict[str, 
                 "forbidden_fields",
                 "mechanism_tags",
                 "transfer_hint",
-                "expression",
             )
             if item.get(key) not in (None, "", [], {})
         }
@@ -1633,12 +2211,14 @@ def _structure_diversity_control(candidates: List[Dict[str, Any]], history_memor
             examples.setdefault(key, expression)
         for key, count in counts.most_common(6):
             if count >= 3:
+                # Same-round repetition cap: these are repeated skeletons in the current
+                # batch, not historically failed structures. Do not fabricate failure stats.
                 overused.append(
                     {
                         "structure_key": key,
                         "count": count,
-                        "failed": count,
-                        "failure_rate": 1.0,
+                        "same_round_repeats": count,
+                        "reason": "same_round_repetition",
                         "example_expression": examples.get(key),
                     }
                 )
@@ -1728,6 +2308,65 @@ def _route_stop_loss_objective(route_stop_loss: Dict[str, Any]) -> str:
         " Route stop-loss is active: recent scoped exploration produced no submitable/watchlist progress. "
         "Do not keep local variants of the same route; switch mechanism class and require visibly different "
         "operator geometry."
+    )
+
+
+def _production_rescue_policy(
+    route_stop_loss: Dict[str, Any],
+    scope_trouble: Dict[str, Any],
+    target_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    route_active = isinstance(route_stop_loss, dict) and bool(route_stop_loss.get("stop_loss_active"))
+    scope_active = isinstance(scope_trouble, dict) and bool(scope_trouble.get("active"))
+    if not route_active and not scope_active:
+        return {"active": False}
+    region = str(target_settings.get("region") or "").upper()
+    delay = str(target_settings.get("delay") if target_settings.get("delay") is not None else "")
+    usa_d0 = region == "USA" and delay == "0"
+    motifs = [
+        "ts_backfill",
+        "winsorize",
+        "ts_rank",
+        "group_rank industry/subindustry",
+        "cap normalization",
+    ] if usa_d0 else ["ts_backfill", "winsorize", "ts_rank", "group_rank"]
+    return {
+        "active": True,
+        "reason": (route_stop_loss.get("reason") if route_active else "") or (
+            "route_stop_loss_active" if route_active else "scope_trouble_active"
+        ),
+        "lit_tower_policy": "soft_tie_breaker",
+        "allow_lit_tower_primary_probes": True,
+        "scope_trouble_active": bool(scope_trouble.get("active")) if isinstance(scope_trouble, dict) else False,
+        "target_scope": {
+            "region": target_settings.get("region"),
+            "universe": target_settings.get("universe"),
+            "delay": target_settings.get("delay"),
+            "neutralization": target_settings.get("neutralization"),
+        },
+        "preferred_motifs": motifs,
+        "policy": (
+            "After route stop-loss, production quality outranks pyramid novelty. Previously lit towers may be used "
+            "as primary probe fields when they have no local failure or metadata block."
+        ),
+    }
+
+
+def _production_rescue_objective(
+    production_rescue: Dict[str, Any],
+    lit_tower_avoidance: Dict[str, Any],
+) -> str:
+    if not isinstance(production_rescue, dict) or not production_rescue.get("active"):
+        return ""
+    names = _lit_tower_names(lit_tower_avoidance)
+    lit_note = f" Existing lit towers are soft tie-breakers, not hard exclusions: {', '.join(names[:8])}." if names else ""
+    motifs = [str(item) for item in production_rescue.get("preferred_motifs") or [] if str(item).strip()]
+    motif_note = f" Prefer production-tested probe motifs: {', '.join(motifs[:6])}." if motifs else ""
+    return (
+        " Production rescue is active: lit towers are soft, quality is the hard gate, and weak unlit novelty must "
+        "not outrank stronger field families."
+        + lit_note
+        + motif_note
     )
 
 
@@ -1902,8 +2541,15 @@ def _normalize_reason(value: Any) -> str:
 
 
 def _avoid_list(failure_reasons: List[str], weak_fields: List[str]) -> List[str]:
-    avoid = list(dict.fromkeys(failure_reasons[:8] + weak_fields[:16]))
+    prioritized_reasons = _prioritized_failure_reasons(failure_reasons)
+    avoid = list(dict.fromkeys(prioritized_reasons[:8] + weak_fields[:16]))
     return avoid[:24] or ["near-duplicates from recent history", "trivial price-volume-only formulas"]
+
+
+def _prioritized_failure_reasons(failure_reasons: List[str]) -> List[str]:
+    unique = list(dict.fromkeys(str(reason) for reason in failure_reasons if str(reason).strip()))
+    priority = [reason for reason in ACTIONABLE_FAILURE_PRIORITY if reason in unique]
+    return priority + [reason for reason in unique if reason not in set(priority)]
 
 
 def _setting_variants(target_settings: Dict[str, Any], batch_size: int) -> List[Dict[str, Any]]:

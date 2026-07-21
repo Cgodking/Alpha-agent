@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -9,11 +10,22 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Protocol
 
 from .expression_similarity import expression_signature_metadata, expression_structure_key, expression_variant_key
-from .models import CandidateSpec, DEFAULT_SETTINGS, SimulationFailure, SimulationResult, SubmitResult
+from .models import (
+    CandidateSpec,
+    DEFAULT_SETTINGS,
+    SimulationFailure,
+    SimulationPending,
+    SimulationPendingError,
+    SimulationResult,
+    SubmitResult,
+)
+from .preflight import validate_expression
+from .profile_compliance import profile_compliance_errors, profile_family_fields, profile_required_family
 
 
 class AIClient(Protocol):
@@ -23,6 +35,36 @@ class AIClient(Protocol):
 
 class AIClientError(RuntimeError):
     pass
+
+
+SIMULATION_CONTEXT_KEYS = set(DEFAULT_SETTINGS) | {"maxTrade"}
+
+
+def _target_settings_from_context(context: Dict[str, Any] | None) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(context or {}).items()
+        if key in SIMULATION_CONTEXT_KEYS
+    }
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+
+def _normalize_orchestration_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"deep", "full"}:
+        return "deep"
+    if normalized in {"lean", "efficient", "personal", "budget"}:
+        return "lean"
+    raise RuntimeError("AI_ORCHESTRATION_MODE must be lean or deep")
 
 
 @dataclass(frozen=True)
@@ -265,10 +307,16 @@ class BrainClient(Protocol):
     def simulate(self, expression: str, settings: Dict[str, Any]) -> SimulationResult:
         ...
 
-    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure]:
+    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure | SimulationPending]:
         ...
 
     def submit_alpha(self, alpha_id: str, dry_run: bool = True) -> SubmitResult:
+        ...
+
+    def get_alpha_correlations(self, alpha_id: str, threshold: float = 0.7) -> Dict[str, Dict[str, Any]]:
+        ...
+
+    def set_alpha_properties(self, alpha_id: str, **properties: Any) -> Dict[str, Any]:
         ...
 
     def discover_datafields(
@@ -298,7 +346,7 @@ class LocalAIClient:
 
     def generate_candidates(self, batch_size: int, context: Dict[str, Any]) -> List[CandidateSpec]:
         settings = dict(DEFAULT_SETTINGS)
-        settings.update({key: value for key, value in dict(context or {}).items() if key != "research_context"})
+        settings.update(_target_settings_from_context(context))
         candidates: List[CandidateSpec] = []
         for idx in range(batch_size):
             expression = self.expressions[idx % len(self.expressions)]
@@ -334,7 +382,7 @@ class LocalBrainClient:
         }
         return SimulationResult(alpha_id=f"LOCAL{digest}", metrics=metrics, checks=checks, raw={"settings": settings})
 
-    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure]:
+    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure | SimulationPending]:
         return [self.simulate(expression, settings) for expression, settings in items]
 
     def submit_alpha(self, alpha_id: str, dry_run: bool = True) -> SubmitResult:
@@ -342,6 +390,27 @@ class LocalBrainClient:
             return SubmitResult(alpha_id=alpha_id, submitted=False, stage="DRY_RUN", message="auto_submit disabled")
         self.submitted.append(alpha_id)
         return SubmitResult(alpha_id=alpha_id, submitted=True, stage="OS", message="local submit accepted")
+
+    def get_alpha_correlations(self, alpha_id: str, threshold: float = 0.7) -> Dict[str, Dict[str, Any]]:
+        return {
+            "self": {
+                "name": "SELF_CORRELATION",
+                "status": "PASS",
+                "value": 0.2,
+                "limit": threshold,
+                "source": f"/alphas/{alpha_id}/correlations/self",
+            },
+            "production": {
+                "name": "PROD_CORRELATION",
+                "status": "PASS",
+                "value": 0.3,
+                "limit": threshold,
+                "source": f"/alphas/{alpha_id}/correlations/prod",
+            },
+        }
+
+    def set_alpha_properties(self, alpha_id: str, **properties: Any) -> Dict[str, Any]:
+        return {"id": alpha_id, **properties}
 
     def count_submitted_alphas(self, start_date: str, end_date: str) -> int:
         return len(self.submitted)
@@ -486,7 +555,7 @@ class OpenAICompatibleAIClient:
         user = json.dumps(
             {
                 "batch_size": batch_size,
-                "target_settings": {key: value for key, value in dict(context or {}).items() if key != "research_context"},
+                "target_settings": _target_settings_from_context(context),
                 "research_context": dict(context or {}).get("research_context", {}),
                 "generator_profiles": generator_profiles,
             },
@@ -523,7 +592,7 @@ class OpenAICompatibleAIClient:
         user = json.dumps(
             {
                 "batch_size": batch_size,
-                "target_settings": {key: value for key, value in dict(context or {}).items() if key != "research_context"},
+                "target_settings": _target_settings_from_context(context),
                 "research_context": dict(context or {}).get("research_context", {}),
                 "generator_profiles": generator_profiles,
                 "initial_plan": initial_plan,
@@ -561,7 +630,7 @@ class OpenAICompatibleAIClient:
         user = json.dumps(
             {
                 "batch_size": batch_size,
-                "target_settings": {key: value for key, value in dict(context or {}).items() if key != "research_context"},
+                "target_settings": _target_settings_from_context(context),
                 "research_context": dict(context or {}).get("research_context", {}),
                 "generator_profiles": generator_profiles,
                 "initial_plan": initial_plan,
@@ -601,7 +670,7 @@ class OpenAICompatibleAIClient:
         user = json.dumps(
             {
                 "batch_size": batch_size,
-                "target_settings": {key: value for key, value in dict(context or {}).items() if key != "research_context"},
+                "target_settings": _target_settings_from_context(context),
                 "research_context": dict(context or {}).get("research_context", {}),
                 "generator_profiles": generator_profiles,
                 "final_plan": final_plan,
@@ -648,7 +717,7 @@ class OpenAICompatibleAIClient:
         user = json.dumps(
             {
                 "batch_size": batch_size,
-                "target_settings": {key: value for key, value in dict(context or {}).items() if key != "research_context"},
+                "target_settings": _target_settings_from_context(context),
                 "research_context": dict(context or {}).get("research_context", {}),
                 "generator_profiles": generator_profiles,
                 "final_plan": final_plan,
@@ -670,7 +739,7 @@ class OpenAICompatibleAIClient:
         context: Dict[str, Any],
     ) -> List[CandidateSpec]:
         context = dict(context or {})
-        target_context = {key: value for key, value in context.items() if key != "research_context"}
+        target_context = _target_settings_from_context(context)
         research_context = context.get("research_context") if isinstance(context.get("research_context"), dict) else {}
         source_by_index = [candidate.source for candidate in candidates]
         metadata_by_index = [dict(candidate.metadata) for candidate in candidates]
@@ -767,7 +836,7 @@ class OpenAICompatibleAIClient:
         context = dict(context or {})
         research_context = context.get("research_context") if isinstance(context.get("research_context"), dict) else {}
         research_context = _compact_generator_research_context(research_context)
-        target_context = {key: value for key, value in context.items() if key != "research_context"}
+        target_context = _target_settings_from_context(context)
         generation_policy = research_context.get("generation_policy", {}) if isinstance(research_context, dict) else {}
         payload = {
             "model": self.model,
@@ -785,6 +854,16 @@ class OpenAICompatibleAIClient:
                         "Treat research_context.experiment_plan as mandatory: follow its mode, objective, keep, "
                         "change, and avoid lists when constructing the batch. For mode optimize_best, generate "
                         "controlled variants around the target_expression instead of unrelated ideas. "
+                        "If research_context.experiment_plan.targeted_repair is active, treat it as a hard repair "
+                        "contract: preserve the high-Sharpe edge, raise Fitness over the required floor, and clear "
+                        "blocked correlation/diversity checks. If targeted_repair.forbid_same_field_only_variants is "
+                        "true, do not spend the batch on the cooled primary fields with only sign/window/group tweaks; "
+                        "transfer the mechanism to fresh allowed primary fields. "
+                        "If research_context.experiment_plan.quality_budget is present, treat its slot allocation "
+                        "as mandatory: fill exploit, probe, optimization, setting-sweep, and broad-explore slots in "
+                        "the requested proportions instead of spending the whole batch on one route. If "
+                        "probe_recommendations are present, use their fields and template families for probe slots "
+                        "before attempting free-form formulas. "
                         "If research_context.experiment_plan.family_diversity_control is present, keep the dominant "
                         "family anchored to a single profile at most and use alternate_families for the other "
                         "active profiles. "
@@ -795,7 +874,16 @@ class OpenAICompatibleAIClient:
                         "to infer tower status from field names. "
                         "If research_context.experiment_plan.field_scout is present, choose primary signal fields from its "
                         "top_fields or the profile-assigned bucket. Respect primary_policy=avoid_primary: those fields may "
-                        "only be helpers. Diversify candidates across the scout buckets instead of repeatedly reusing one field. "
+                        "only be helpers. Respect each field_scout usage_constraints entry: fields marked "
+                        "requires_turnover_stabilizer must not appear as raw rank/normalize/group_zscore legs without a "
+                        "turnover-stabilizing structure, and fields marked event_field_not_direct_rank_input must not be "
+                        "passed directly, or through only normalize/vec_avg, as the first input to rank or ts_* operators. "
+                        "If those constraints cannot be satisfied cleanly, choose another top_primary field. "
+                        "For a new broad_explore run, do not treat field_scout.retest_primary_fields as mandatory; "
+                        "prefer fresh, economically grounded primary fields and avoid copying prior failed wrappers. "
+                        "Diversify candidates across the scout buckets instead of repeatedly reusing one field. "
+                        "If research_context.experiment_plan.field_exposure_control is present, never use its "
+                        "cooldown_fields as primary signal fields; move to fresh fields and families instead. "
                         "If research_context.experiment_plan.mechanism_transfer is present, use its archetypes as mechanism only "
                         "examples. Do not copy their expressions. Do not copy forbidden_fields into primary alpha legs. Transfer "
                         "the mechanism to fresh, allowed, non-submitted fields while keeping auxiliary fields only as helpers. "
@@ -803,17 +891,25 @@ class OpenAICompatibleAIClient:
                         "change mechanism class and operator geometry. If structure_diversity_control is present, generate no "
                         "more than its max_batch_candidates_per_structure candidates per field-agnostic formula skeleton. "
                         "If research_context.profile_guidance is present, treat it as mandatory model-specific "
-                        "direction and generate candidates only within that assigned route. "
+                        "direction and generate candidates only within that assigned route. If "
+                        "research_context.profile_family_field_ids is present, choose this profile's catalog fields "
+                        "from that list and do not mix in other catalog families as alpha legs. "
                         "Treat research_context.syntax_constraints as hard syntax policy: use only its "
                         "allowed_operators, avoid its recent_preflight_rejections, and copy field ids exactly. "
+                        "Respect research_context.syntax_constraints.exact_operator_arity: operators listed there "
+                        "must use exactly that many arguments. In particular, group_mean(x, weight, group) has "
+                        "three arguments; never write group_mean(x, group). hump(x) has one argument. "
                         "Treat research_context.syntax_constraints.auxiliary_only_fields as helper fields only: "
                         "do not make close, vwap, open, high, low, volume, returns, cap, or adv20 the primary "
                         "alpha signal or a standalone additive/subtractive leg. Use them only as denominators, "
                         "scale/liquidity controls, risk filters, or conditions around non-auxiliary datafields. "
                         "Respect datafield types: MATRIX fields may be used directly with time-series operators; "
                         "VECTOR fields must first be reduced with a valid single-argument vec_* reducer before any "
-                        "ts_ operator. Never pass a VECTOR field directly into ts_backfill, ts_mean, ts_rank, "
-                        "winsorize, rank, or group_rank. vec_avg(x) only: never write vec_avg(x, window); "
+                        "ts_ operator and before scalar/value operators such as add, subtract, multiply, divide, "
+                        "normalize, zscore, and group_mean. Never pass a VECTOR field directly into ts_backfill, "
+                        "ts_mean, ts_rank, winsorize, rank, group_rank, normalize, subtract, add, multiply, divide, "
+                        "or group_mean. Use subtract(vec_avg(vector_a), vec_avg(vector_b)), never "
+                        "subtract(vector_a, vector_b). vec_avg(x) only: never write vec_avg(x, window); "
                         "put windows outside vector reducers, e.g. ts_mean(vec_avg(vector_field), 30). "
                         "Use divide(x, y), never div(x, y). group_rank(x, group) has exactly two arguments; "
                         "put time windows inside ts_ operators, e.g. group_rank(ts_rank(x, 63), industry), "
@@ -840,7 +936,10 @@ class OpenAICompatibleAIClient:
                                 "use_only_datafields_from_context": True,
                                 "respect_datafield_types": True,
                                 "vector_fields_require_vec_reduction": True,
+                                "vector_fields_require_vec_reduction_before_scalar_value_operators": True,
                                 "use_only_syntax_allowed_operators": True,
+                                "respect_exact_operator_arity": True,
+                                "group_mean_requires_value_weight_group": True,
                                 "vec_reducers_are_single_argument_only": True,
                                 "use_divide_not_div": True,
                                 "group_rank_accepts_value_and_group_only": True,
@@ -854,6 +953,11 @@ class OpenAICompatibleAIClient:
                                 "avoid_recent_approved_submitted_fields": True,
                                 "respect_route_stop_loss": True,
                                 "respect_structure_diversity_control": True,
+                                "respect_quality_budget": True,
+                                "use_probe_recommendations_for_probe_slots": True,
+                                "respect_field_scout_usage_constraints": True,
+                                "high_turnover_raw_fields_require_turnover_stabilizer": True,
+                                "event_fields_cannot_be_rank_inputs": True,
                             },
                         },
                         sort_keys=True,
@@ -1078,14 +1182,21 @@ class MultiModelAIClient:
         generators: List[Any] | None = None,
         validators: List[Any] | None = None,
         client_factory: Callable[[ModelProfile], Any] | None = None,
+        orchestration_mode: str = "deep",
+        max_active_generators: int = 0,
+        targeted_repair_generators: int = 2,
     ):
         self.controllers = list(controllers or [])
         self.generators = list(generators or [])
         self.validators = list(validators or [])
         self.client_factory = client_factory or OpenAICompatibleAIClient.from_profile
+        self.orchestration_mode = _normalize_orchestration_mode(orchestration_mode)
+        self.max_active_generators = max(0, int(max_active_generators or 0))
+        self.targeted_repair_generators = max(0, int(targeted_repair_generators or 0))
         self.last_plan: Dict[str, Any] = {}
         self.last_errors: List[Dict[str, Any]] = []
         self.last_validator_rejections: List[Dict[str, Any]] = []
+        self.last_partial_candidates: List[CandidateSpec] = []
         for profile in profiles or []:
             client = self.client_factory(profile)
             if profile.role in {"controller", "critic"}:
@@ -1097,11 +1208,19 @@ class MultiModelAIClient:
 
     @classmethod
     def from_env(cls) -> "MultiModelAIClient":
-        return cls(profiles=parse_model_profiles_from_env())
+        orchestration_mode = _normalize_orchestration_mode(os.getenv("AI_ORCHESTRATION_MODE", "lean"))
+        default_active = 1 if orchestration_mode == "lean" else 0
+        return cls(
+            profiles=parse_model_profiles_from_env(),
+            orchestration_mode=orchestration_mode,
+            max_active_generators=_int_env("AI_MAX_ACTIVE_GENERATORS", default_active),
+            targeted_repair_generators=_int_env("AI_TARGETED_REPAIR_GENERATORS", 2),
+        )
 
     def generate_candidates(self, batch_size: int, context: Dict[str, Any]) -> List[CandidateSpec]:
         self.last_errors = []
         self.last_validator_rejections = []
+        self.last_partial_candidates = []
         if not self.generators:
             raise AIClientError("AI_CLIENT=multi requires at least one generator or optimizer profile")
         allocation = self._allocation(batch_size, context)
@@ -1109,6 +1228,7 @@ class MultiModelAIClient:
         candidates = self._tag_orchestration_metadata(candidates, allocation)
         candidates = self._dedupe_candidates(candidates, context)[:batch_size]
         candidates = self.validate_candidate_specs(candidates, batch_size, context, preserve_setting_variants=False)
+        self.last_partial_candidates = list(candidates)
         initial_rejections = list(self.last_validator_rejections)
         candidates = self._repair_candidates_once(
             candidates,
@@ -1116,6 +1236,7 @@ class MultiModelAIClient:
             context,
             initial_rejections,
         )
+        self.last_partial_candidates = list(candidates)
         if not candidates and self.last_errors:
             details = "; ".join(
                 f"{item.get('profile')}:{item.get('error')}" for item in self.last_errors
@@ -1131,11 +1252,19 @@ class MultiModelAIClient:
         preserve_setting_variants: bool = True,
     ) -> List[CandidateSpec]:
         self.last_validator_rejections = []
+        if self._lean_orchestration_enabled(context):
+            accepted, local_rejections = _local_preflight_filter(candidates, context)
+            self.last_validator_rejections = local_rejections
+            return _quality_budget_select(accepted, context, batch_size)
         if not self.validators or not candidates:
-            return candidates[:batch_size]
+            accepted, local_rejections = _local_preflight_filter(candidates, context)
+            self.last_validator_rejections = local_rejections
+            return _quality_budget_select(accepted, context, batch_size)
         validator = self.validators[0]
         if not hasattr(validator, "validate_candidate_specs"):
-            return candidates[:batch_size]
+            accepted, local_rejections = _local_preflight_filter(candidates, context)
+            self.last_validator_rejections = local_rejections
+            return _quality_budget_select(accepted, context, batch_size)
         try:
             before_validation = list(candidates)
             validated = self._call_with_hard_timeout(
@@ -1146,21 +1275,28 @@ class MultiModelAIClient:
                 context,
             )
             if not isinstance(validated, list):
-                return candidates[:batch_size]
+                accepted, local_rejections = _local_preflight_filter(candidates, context)
+                self.last_validator_rejections = local_rejections
+                return accepted[:batch_size]
             validated = self._restore_validator_settings(before_validation, validated)
             if preserve_setting_variants:
-                validated = self._dedupe_candidates_by_settings(validated)[:batch_size]
+                validated = self._dedupe_candidates_by_settings(validated)
             else:
-                validated = self._dedupe_candidates(validated, context)[:batch_size]
-            self.last_validator_rejections = self._validator_rejections(
+                validated = self._dedupe_candidates(validated, context)
+            validator_rejections = self._validator_rejections(
                 before_validation,
                 validated,
                 validator,
             )
+            validated, local_rejections = _local_preflight_filter(validated, context)
+            validated = _quality_budget_select(validated, context, batch_size)
+            self.last_validator_rejections = validator_rejections + local_rejections
             return validated
         except Exception as exc:
             self._record_model_error(validator, exc)
-            return candidates[:batch_size]
+            accepted, local_rejections = _local_preflight_filter(candidates, context)
+            self.last_validator_rejections = local_rejections
+            return _quality_budget_select(accepted, context, batch_size)
 
     def _repair_candidates_once(
         self,
@@ -1170,7 +1306,51 @@ class MultiModelAIClient:
         initial_rejections: List[Dict[str, Any]],
     ) -> List[CandidateSpec]:
         remaining_slots = max(0, int(batch_size) - len(candidates))
-        if remaining_slots <= 0 or not self.controllers:
+        if remaining_slots <= 0:
+            self.last_validator_rejections = initial_rejections
+            return candidates[:batch_size]
+
+        local_repairs = _local_vector_preflight_repairs(initial_rejections, context)
+        if local_repairs:
+            combined = self._dedupe_candidates(candidates + local_repairs, context)[:batch_size]
+            accepted, repair_rejections = _local_preflight_filter(combined, context)
+            accepted = _quality_budget_select(accepted, context, batch_size)
+            if accepted:
+                self.last_plan["intra_round_repair"] = {
+                    "action": "local_vector_repair",
+                    "remaining_slots": remaining_slots,
+                    "accepted_count": len(candidates),
+                    "initial_validator_rejections": len(initial_rejections),
+                    "generated": len(local_repairs),
+                    "final_count": len(accepted),
+                    "policy": (
+                        "Raw VECTOR field preflight failures were repaired locally by wrapping vector fields "
+                        "with vec_avg before scalar/value operators, avoiding an extra AI refill call."
+                    ),
+                }
+                if len(accepted) >= int(batch_size) or not self._lean_direct_refill_enabled(context):
+                    self.last_validator_rejections = repair_rejections
+                    return accepted[:batch_size]
+                candidates = accepted[:batch_size]
+                self.last_partial_candidates = list(candidates)
+                remaining_slots = max(0, int(batch_size) - len(candidates))
+                initial_rejections = initial_rejections + repair_rejections
+
+        if self._lean_orchestration_enabled(context):
+            if self._lean_direct_refill_enabled(context):
+                self.last_partial_candidates = list(candidates)
+                return self._refill_candidates_direct(
+                    candidates,
+                    batch_size,
+                    context,
+                    initial_rejections,
+                    remaining_slots,
+                    reason="balanced_lean_underfilled",
+                )
+            self.last_validator_rejections = initial_rejections
+            return candidates[:batch_size]
+
+        if not self.controllers:
             self.last_validator_rejections = initial_rejections
             return candidates[:batch_size]
 
@@ -1230,8 +1410,21 @@ class MultiModelAIClient:
         self.last_plan["intra_round_repair"] = repair_record
 
         if action not in {"refill", "repair"}:
-            self.last_validator_rejections = initial_rejections
-            return candidates[:batch_size]
+            if action == "abandon":
+                self.last_validator_rejections = initial_rejections
+                return candidates[:batch_size]
+            if not candidates and _only_local_preflight_rejections(initial_rejections):
+                action = "refill"
+                decision = {
+                    **decision,
+                    "action": "refill",
+                    "rationale": str(decision.get("rationale") or "empty local-preflight batch; refill once"),
+                }
+                self.last_plan["intra_round_repair"]["action"] = "refill"
+                self.last_plan["intra_round_repair"]["reason"] = "empty_local_preflight_batch"
+            else:
+                self.last_validator_rejections = initial_rejections
+                return candidates[:batch_size]
 
         refill_allocation = self._normalize_repair_allocation(
             decision.get("allocation") or decision.get("refill_allocation"),
@@ -1243,6 +1436,7 @@ class MultiModelAIClient:
             return candidates[:batch_size]
 
         self.last_plan["intra_round_repair"]["refill_allocation"] = refill_allocation
+        self.last_partial_candidates = list(candidates)
         original_guidance = dict(self.last_plan.get("profile_guidance") or {})
         if repair_guidance:
             self.last_plan["profile_guidance"] = self._merge_profile_guidance(original_guidance, repair_guidance)
@@ -1265,8 +1459,79 @@ class MultiModelAIClient:
         self.last_plan["intra_round_repair"]["final_count"] = len(validated)
         return validated[:batch_size]
 
+    def _lean_direct_refill_enabled(self, context: Dict[str, Any]) -> bool:
+        if not self._lean_orchestration_enabled(context):
+            return False
+        if self.max_active_generators > 0:
+            return False
+        return len(self._eligible_generators(context)) > 1
+
+    def _refill_candidates_direct(
+        self,
+        candidates: List[CandidateSpec],
+        batch_size: int,
+        context: Dict[str, Any],
+        initial_rejections: List[Dict[str, Any]],
+        remaining_slots: int,
+        *,
+        reason: str,
+    ) -> List[CandidateSpec]:
+        refill_allocation = self._fallback_allocation(remaining_slots, context)
+        if not refill_allocation:
+            self.last_validator_rejections = initial_rejections
+            return candidates[:batch_size]
+        repair_record = dict(self.last_plan.get("intra_round_repair") or {})
+        if not repair_record:
+            repair_record = {
+                "action": "refill",
+                "accepted_count": len(candidates),
+                "initial_validator_rejections": len(initial_rejections),
+            }
+        repair_record.update(
+            {
+                "action": "refill",
+                "reason": reason,
+                "remaining_slots": remaining_slots,
+                "accepted_count": len(candidates),
+                "refill_allocation": refill_allocation,
+            }
+        )
+        self.last_plan["intra_round_repair"] = repair_record
+        decision = {
+            "action": "refill",
+            "rationale": "balanced lean mode must refill after local filtering underfills the batch",
+        }
+        repair_context = dict(context)
+        repair_context["intra_round_refill"] = {
+            "reason": reason,
+            "remaining_slots": remaining_slots,
+            "accepted_count": len(candidates),
+        }
+        refill_candidates = self._generate_allocated_candidates(refill_allocation, repair_context)
+        refill_candidates = self._tag_orchestration_metadata(refill_candidates, refill_allocation)
+        refill_candidates = self._tag_repair_metadata(refill_candidates, refill_allocation, decision)
+        combined = self._dedupe_candidates(candidates + refill_candidates, context)[:batch_size]
+        validated = self.validate_candidate_specs(combined, batch_size, context, preserve_setting_variants=False)
+        repair_rejections = list(self.last_validator_rejections)
+        self.last_validator_rejections = initial_rejections + repair_rejections
+        self.last_plan["intra_round_repair"]["generated"] = len(refill_candidates)
+        self.last_plan["intra_round_repair"]["final_count"] = len(validated)
+        return validated[:batch_size]
+
     def _allocation(self, batch_size: int, context: Dict[str, Any]) -> Dict[str, int]:
         generator_profiles = [_client_profile_dict(generator) for generator in self.generators]
+        if self._lean_orchestration_enabled(context):
+            allocation = self._fallback_allocation(batch_size, context)
+            self.last_plan = {
+                "controller": "lean",
+                "allocation": allocation,
+                "profile_guidance": {},
+                "orchestration_mode": self.orchestration_mode,
+            }
+            experiment_plan = _experiment_plan_from_context(context)
+            if experiment_plan:
+                self.last_plan["experiment_plan"] = experiment_plan
+            return allocation
         if self.controllers:
             controller = self.controllers[0]
             if hasattr(controller, "plan_generation"):
@@ -1322,6 +1587,9 @@ class MultiModelAIClient:
         if experiment_plan:
             self.last_plan["experiment_plan"] = experiment_plan
         return allocation
+
+    def _lean_orchestration_enabled(self, context: Dict[str, Any] | None = None) -> bool:
+        return self.orchestration_mode == "lean"
 
     def _collect_controller_critiques(
         self,
@@ -1763,12 +2031,27 @@ class MultiModelAIClient:
         generator_context = dict(context or {})
         research_context = generator_context.get("research_context")
         research_context = dict(research_context) if isinstance(research_context, dict) else {}
-        if isinstance(profile_guidance, dict) and profile_guidance:
-            experiment_plan = research_context.get("experiment_plan") if isinstance(research_context.get("experiment_plan"), dict) else {}
+        experiment_plan = research_context.get("experiment_plan") if isinstance(research_context.get("experiment_plan"), dict) else {}
+        if (
+            isinstance(profile_guidance, dict)
+            and profile_guidance
+            and not _targeted_experiment_mode(str(experiment_plan.get("mode") or ""))
+        ):
             family_control = experiment_plan.get("family_diversity_control") if isinstance(experiment_plan, dict) else {}
             research_context["profile_name"] = profile_name
             research_context["profile_role"] = str(getattr(generator, "role", "") or "")
             research_context["profile_guidance"] = profile_guidance
+            family_fields = profile_family_fields({"research_context": research_context}, profile_guidance)
+            if family_fields:
+                required_family = profile_required_family(profile_guidance)
+                research_context["profile_family_field_ids"] = family_fields
+                research_context["profile_family_policy"] = {
+                    "required_family": required_family,
+                    "policy": (
+                        "Use catalog fields outside profile_family_field_ids only as approved auxiliary market controls; "
+                        "do not use non-family catalog fields as additive alpha legs for this profile."
+                    ),
+                }
             if isinstance(family_control, dict) and family_control:
                 dominant_family = str(family_control.get("dominant_family") or "").strip()
                 alternate_families = [str(item) for item in family_control.get("alternate_families") or [] if str(item).strip()]
@@ -1811,7 +2094,31 @@ class MultiModelAIClient:
         context: Dict[str, Any],
         plan: Dict[str, Any] | None = None,
     ) -> List[Any]:
-        return list(self.generators)
+        generators = list(self.generators)
+        if (
+            self.orchestration_mode != "lean"
+            and _targeted_repair_requires_deep(context)
+            and self.targeted_repair_generators > 0
+        ):
+            return generators[: self.targeted_repair_generators]
+        if self.max_active_generators > 0:
+            return self._least_used_generators(generators, context, self.max_active_generators)
+        return generators
+
+    def _least_used_generators(self, generators: List[Any], context: Dict[str, Any], limit: int) -> List[Any]:
+        if not generators:
+            return []
+        profile_counts = _profile_generation_counts(context)
+        if not profile_counts:
+            return generators[:limit]
+        ordered = sorted(
+            enumerate(generators),
+            key=lambda item: (
+                profile_counts.get(_client_profile_name(item[1]), 0),
+                item[0],
+            ),
+        )
+        return [generator for _idx, generator in ordered[:limit]]
 
     @staticmethod
     def _balanced_exploration_required(context: Dict[str, Any], plan: Dict[str, Any] | None = None) -> bool:
@@ -1926,7 +2233,11 @@ class MultiModelAIClient:
             experiment_plan = self._active_experiment_plan()
             if experiment_plan:
                 metadata.update(experiment_plan)
-            if isinstance(candidate_guidance, dict) and candidate_guidance:
+            if (
+                isinstance(candidate_guidance, dict)
+                and candidate_guidance
+                and not _targeted_experiment_mode(str(experiment_plan.get("experiment_plan_mode") or ""))
+            ):
                 metadata["profile_guidance"] = candidate_guidance
             tagged.append(
                 CandidateSpec(
@@ -2024,6 +2335,391 @@ class MultiModelAIClient:
         )
 
 
+def _local_preflight_filter(
+    candidates: List[CandidateSpec],
+    context: Dict[str, Any],
+) -> tuple[List[CandidateSpec], List[Dict[str, Any]]]:
+    accepted: List[CandidateSpec] = []
+    rejections: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        errors = _local_preflight_errors(candidate, context)
+        if not errors:
+            accepted.append(candidate)
+            continue
+        rejections.append(
+            {
+                "reason": f"LOCAL_PREFLIGHT:{';'.join(errors)}",
+                "validator_profile": "local-preflight",
+                "validator_model": "",
+                "candidate": _candidate_to_dict(candidate),
+            }
+        )
+    return accepted, rejections
+
+
+def _only_local_preflight_rejections(rejections: List[Dict[str, Any]]) -> bool:
+    if not rejections:
+        return False
+    return all(str(rejection.get("reason") or "").startswith("LOCAL_PREFLIGHT:") for rejection in rejections)
+
+
+def _local_vector_preflight_repairs(
+    rejections: List[Dict[str, Any]],
+    context: Dict[str, Any],
+) -> List[CandidateSpec]:
+    field_types = _context_field_types(context)
+    vector_fields = {
+        str(field)
+        for field, field_type in field_types.items()
+        if str(field_type or "").strip().upper() == "VECTOR" and str(field).strip()
+    }
+    if not vector_fields:
+        return []
+
+    repaired: List[CandidateSpec] = []
+    seen: set[str] = set()
+    for rejection in rejections:
+        if not isinstance(rejection, dict):
+            continue
+        reason = str(rejection.get("reason") or "")
+        if "LOCAL_PREFLIGHT:" not in reason or "INVALID_VECTOR_" not in reason:
+            continue
+        candidate = rejection.get("candidate")
+        if not isinstance(candidate, dict):
+            continue
+        expression = str(candidate.get("expression") or "").strip()
+        if not expression:
+            continue
+        repaired_expression = _wrap_raw_vector_fields(expression, vector_fields)
+        if repaired_expression == expression:
+            continue
+        settings = candidate.get("settings") if isinstance(candidate.get("settings"), dict) else {}
+        source = str(candidate.get("source") or "model:local_vector_repair")
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        spec = CandidateSpec(
+            expression=repaired_expression,
+            settings=dict(settings),
+            source=source,
+            metadata={
+                **metadata,
+                "local_preflight_repair": True,
+                "local_repair_reason": "raw_vector_fields_wrapped_with_vec_avg",
+                "original_expression": expression,
+            },
+        )
+        if _local_preflight_errors(spec, context):
+            continue
+        key = _candidate_spec_key(spec.expression, spec.settings)
+        if key in seen:
+            continue
+        seen.add(key)
+        repaired.append(spec)
+    return repaired
+
+
+def _wrap_raw_vector_fields(expression: str, vector_fields: set[str]) -> str:
+    result = str(expression or "")
+    vector_reducers = ("vec_avg", "vec_count", "vec_max", "vec_min", "vec_range", "vec_stddev", "vec_sum")
+    for field in sorted(vector_fields, key=len, reverse=True):
+        field_pattern = re.compile(rf"\b{re.escape(field)}\b")
+
+        def replace(match: re.Match[str]) -> str:
+            prefix = result[: match.start()].rstrip()
+            if any(re.search(rf"\b{re.escape(reducer)}\s*\($", prefix) for reducer in vector_reducers):
+                return match.group(0)
+            return f"vec_avg({match.group(0)})"
+
+        result = field_pattern.sub(replace, result)
+    return result
+
+
+def _local_preflight_errors(candidate: CandidateSpec, context: Dict[str, Any]) -> List[str]:
+    errors = profile_compliance_errors(candidate, context)
+    errors.extend(validate_expression(
+        candidate.expression,
+        allowed_fields=_context_allowed_fields(context) or None,
+        field_types=_context_field_types(context),
+        enforce_auxiliary_field_roles=_context_enforces_auxiliary_roles(context),
+        auxiliary_fields=_context_auxiliary_fields(context),
+        event_fields=_context_event_fields(context),
+    ))
+    errors.extend(_high_turnover_raw_field_errors(candidate.expression, context))
+    return list(dict.fromkeys(errors))
+
+
+def _quality_budget_select(
+    candidates: List[CandidateSpec],
+    context: Dict[str, Any],
+    batch_size: int,
+) -> List[CandidateSpec]:
+    if not candidates:
+        return []
+    plan = _context_research_context(context).get("experiment_plan")
+    if not isinstance(plan, dict):
+        return candidates[:batch_size]
+    quality_budget = plan.get("quality_budget")
+    slots = quality_budget.get("slots") if isinstance(quality_budget, dict) else None
+    if not isinstance(slots, dict) or not slots:
+        return candidates[:batch_size]
+
+    selected: List[CandidateSpec] = []
+    selected_indexes: set[int] = set()
+    route_order = (
+        "setting_sweep",
+        "optimize_anchor",
+        "exploit_positive_evidence",
+        "probe_new_fields",
+        "broad_explore",
+    )
+    for route in route_order:
+        quota = _budget_slot_count(slots.get(route))
+        if quota <= 0:
+            continue
+        for index, candidate in enumerate(candidates):
+            if len(selected) >= max(0, int(batch_size)):
+                return selected
+            if index in selected_indexes:
+                continue
+            if _candidate_budget_route(candidate, plan) != route:
+                continue
+            selected.append(candidate)
+            selected_indexes.add(index)
+            quota -= 1
+            if quota <= 0:
+                break
+
+    if _production_rescue_budget_active(plan):
+        return selected
+
+    for index, candidate in enumerate(candidates):
+        if len(selected) >= max(0, int(batch_size)):
+            break
+        if index not in selected_indexes:
+            selected.append(candidate)
+    return selected
+
+
+def _production_rescue_budget_active(plan: Dict[str, Any]) -> bool:
+    production_rescue = plan.get("production_rescue")
+    if not isinstance(production_rescue, dict) or not production_rescue.get("active"):
+        return False
+    quality_budget = plan.get("quality_budget") if isinstance(plan.get("quality_budget"), dict) else {}
+    slots = quality_budget.get("slots") if isinstance(quality_budget, dict) else {}
+    return isinstance(slots, dict) and _budget_slot_count(slots.get("probe_new_fields")) > 0
+
+
+def _budget_slot_count(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_budget_route(candidate: CandidateSpec, plan: Dict[str, Any]) -> str:
+    quality_budget = plan.get("quality_budget") if isinstance(plan.get("quality_budget"), dict) else {}
+    expression = str(candidate.expression or "")
+    if _expression_uses_any_field(expression, quality_budget.get("exploit_fields")):
+        return "exploit_positive_evidence"
+    if _expression_uses_any_field(expression, _probe_recommendation_fields(plan)):
+        return "probe_new_fields"
+    mode = str(plan.get("mode") or "")
+    if mode == "setting_sweep":
+        return "setting_sweep"
+    if mode == "optimize_best":
+        return "optimize_anchor"
+    return "broad_explore"
+
+
+def _profile_generation_counts(context: Dict[str, Any]) -> Dict[str, int]:
+    research_context = _context_research_context(context)
+    counts: Dict[str, int] = {}
+    for key in ("active_run_history_memory", "history_memory"):
+        memory = research_context.get(key) if isinstance(research_context.get(key), dict) else {}
+        outcomes = memory.get("profile_outcomes") if isinstance(memory, dict) else {}
+        if not isinstance(outcomes, dict):
+            continue
+        for profile, row in outcomes.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                generated = int(row.get("generated") or 0)
+            except (TypeError, ValueError):
+                generated = 0
+            counts[str(profile)] = counts.get(str(profile), 0) + generated
+    return counts
+
+
+def _probe_recommendation_fields(plan: Dict[str, Any]) -> List[str]:
+    recommendations = plan.get("probe_recommendations")
+    if not isinstance(recommendations, list):
+        return []
+    fields: List[str] = []
+    for recommendation in recommendations:
+        if isinstance(recommendation, dict) and str(recommendation.get("field") or "").strip():
+            fields.append(str(recommendation["field"]))
+    return fields
+
+
+def _expression_uses_any_field(expression: str, fields: Any) -> bool:
+    if not isinstance(fields, list):
+        return False
+    for field in fields:
+        field_id = str(field or "").strip()
+        if field_id and re.search(rf"\b{re.escape(field_id)}\b", expression):
+            return True
+    return False
+
+
+def _context_research_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    research_context = context.get("research_context") if isinstance(context, dict) else None
+    return research_context if isinstance(research_context, dict) else {}
+
+
+def _context_datafields(context: Dict[str, Any]) -> Dict[str, Any]:
+    datafields = _context_research_context(context).get("datafields")
+    return datafields if isinstance(datafields, dict) else {}
+
+
+def _context_allowed_fields(context: Dict[str, Any]) -> List[str]:
+    field_ids = _context_datafields(context).get("field_ids")
+    return [str(field) for field in field_ids] if isinstance(field_ids, list) else []
+
+
+def _context_field_types(context: Dict[str, Any]) -> Dict[str, str]:
+    datafields = _context_datafields(context)
+    field_types = datafields.get("field_types")
+    if isinstance(field_types, dict):
+        return {str(field): str(field_type) for field, field_type in field_types.items()}
+    fields = datafields.get("fields")
+    if not isinstance(fields, list):
+        return {}
+    result: Dict[str, str] = {}
+    for field in fields:
+        if isinstance(field, dict) and field.get("id") and field.get("type"):
+            result[str(field["id"])] = str(field["type"])
+    return result
+
+
+def _context_field_metadata(context: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    fields = _context_datafields(context).get("fields")
+    if not isinstance(fields, list):
+        return {}
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for field in fields:
+        if isinstance(field, dict) and field.get("id"):
+            metadata[str(field["id"])] = field
+    return metadata
+
+
+def _context_event_fields(context: Dict[str, Any]) -> List[str]:
+    event_fields: List[str] = []
+    for field_id, metadata in _context_field_metadata(context).items():
+        category = str(metadata.get("category") or "").lower()
+        dataset_id = str(metadata.get("dataset_id") or metadata.get("datasetId") or "").lower()
+        dataset_name = str(metadata.get("dataset_name") or metadata.get("datasetName") or "").lower()
+        if (
+            "news" in category
+            or "event" in category
+            or dataset_id.startswith(("news", "nws"))
+            or "news" in dataset_name
+            or "event" in dataset_name
+        ):
+            event_fields.append(field_id)
+    return event_fields
+
+
+def _context_enforces_auxiliary_roles(context: Dict[str, Any]) -> bool:
+    research_context = _context_research_context(context)
+    generation_policy = research_context.get("generation_policy")
+    if isinstance(generation_policy, dict) and generation_policy.get("auxiliary_fields_must_not_be_primary"):
+        return True
+    syntax_constraints = research_context.get("syntax_constraints")
+    return isinstance(syntax_constraints, dict) and bool(syntax_constraints.get("auxiliary_only_fields"))
+
+
+def _context_auxiliary_fields(context: Dict[str, Any]) -> List[str]:
+    syntax_constraints = _context_research_context(context).get("syntax_constraints")
+    if not isinstance(syntax_constraints, dict):
+        return []
+    fields = syntax_constraints.get("auxiliary_only_fields")
+    return [str(field) for field in fields] if isinstance(fields, list) else []
+
+
+HIGH_TURNOVER_RAW_CATEGORIES = {
+    "earnings",
+    "insiders",
+    "news",
+    "sentiment",
+    "shortinterest",
+    "short interest",
+    "socialmedia",
+    "social media",
+}
+
+HIGH_TURNOVER_RAW_DATASET_PREFIXES = (
+    "earn",
+    "ern",
+    "insd",
+    "insider",
+    "news",
+    "nws",
+    "sentiment",
+    "snt",
+    "short",
+    "shrt",
+    "social",
+    "scl",
+)
+
+TURNOVER_STABILIZER_OPERATORS = (
+    "ts_backfill",
+    "ts_decay_linear",
+    "ts_ir",
+    "ts_mean",
+    "ts_quantile",
+    "ts_rank",
+    "ts_scale",
+    "ts_std_dev",
+    "ts_sum",
+    "ts_zscore",
+)
+
+
+def _high_turnover_raw_field_errors(expression: str, context: Dict[str, Any]) -> List[str]:
+    if _context_experiment_mode(context) == "setting_sweep":
+        return []
+    text = str(expression or "")
+    if _has_turnover_stabilizer(text):
+        return []
+    errors: List[str] = []
+    for field_id, metadata in _context_field_metadata(context).items():
+        if not _is_high_turnover_raw_field(field_id, metadata):
+            continue
+        if re.search(rf"\b{re.escape(field_id)}\b", text):
+            errors.append(f"HIGH_TURNOVER_RAW_FIELD:{field_id}")
+    return errors
+
+
+def _context_experiment_mode(context: Dict[str, Any]) -> str:
+    plan = _context_research_context(context).get("experiment_plan")
+    return str(plan.get("mode") or "") if isinstance(plan, dict) else ""
+
+
+def _has_turnover_stabilizer(expression: str) -> bool:
+    return any(re.search(rf"\b{re.escape(operator)}\s*\(", expression) for operator in TURNOVER_STABILIZER_OPERATORS)
+
+
+def _is_high_turnover_raw_field(field_id: str, metadata: Dict[str, Any]) -> bool:
+    category = str(metadata.get("category") or "").strip().lower()
+    dataset_id = str(metadata.get("dataset_id") or metadata.get("datasetId") or "").strip().lower()
+    dataset_name = str(metadata.get("dataset_name") or metadata.get("datasetName") or "").strip().lower()
+    if category in HIGH_TURNOVER_RAW_CATEGORIES:
+        return True
+    return dataset_id.startswith(HIGH_TURNOVER_RAW_DATASET_PREFIXES) or dataset_name.startswith(
+        HIGH_TURNOVER_RAW_DATASET_PREFIXES
+    )
+
+
 def _client_profile_name(client: Any) -> str:
     name = str(getattr(client, "profile_name", "") or "").strip()
     if name:
@@ -2050,6 +2746,8 @@ def _compact_generator_research_context(research_context: Dict[str, Any]) -> Dic
         "profile_name",
         "profile_role",
         "profile_guidance",
+        "profile_family_field_ids",
+        "profile_family_policy",
         "family_diversity_control",
         "orchestration_policy",
         "intra_round_repair",
@@ -2127,6 +2825,8 @@ def _compact_controller_syntax(syntax: Dict[str, Any]) -> Dict[str, Any]:
     for key in (
         "allowed_operators",
         "operator_rule",
+        "exact_operator_arity",
+        "operator_arity_rule",
         "field_rule",
         "auxiliary_only_fields",
         "auxiliary_field_rule",
@@ -2203,7 +2903,14 @@ def _compact_lit_tower_avoidance(avoidance: Dict[str, Any]) -> Dict[str, Any]:
 
 def _compact_field_scout(field_scout: Dict[str, Any]) -> Dict[str, Any]:
     compact: Dict[str, Any] = {}
-    for key in ("active", "policy", "scoring"):
+    for key in (
+        "active",
+        "status",
+        "top_field_count",
+        "top_primary_field_count",
+        "policy",
+        "scoring",
+    ):
         if key in field_scout:
             compact[key] = _compact_generic(field_scout[key], depth=0, list_limit=20)
     top_fields = field_scout.get("top_fields")
@@ -2220,12 +2927,44 @@ def _compact_field_scout(field_scout: Dict[str, Any]) -> Dict[str, Any]:
             "pyramidMultiplier",
             "explored_count",
             "failed_count",
+            "dataset_count",
+            "dataset_failed_count",
+            "field_reason",
+            "dataset_reason",
             "tower_status",
             "primary_policy",
+            "usage_constraints",
         )
         compact["top_fields"] = [
             {key: _compact_generic(row[key], depth=0, list_limit=4) for key in keep_keys if key in row}
             for row in top_fields[:40]
+            if isinstance(row, dict)
+        ]
+    top_primary_fields = field_scout.get("top_primary_fields")
+    if isinstance(top_primary_fields, list):
+        keep_keys = (
+            "field",
+            "score",
+            "type",
+            "dataset_id",
+            "category",
+            "coverage",
+            "userCount",
+            "alphaCount",
+            "pyramidMultiplier",
+            "explored_count",
+            "failed_count",
+            "dataset_count",
+            "dataset_failed_count",
+            "field_reason",
+            "dataset_reason",
+            "tower_status",
+            "primary_policy",
+            "usage_constraints",
+        )
+        compact["top_primary_fields"] = [
+            {key: _compact_generic(row[key], depth=0, list_limit=4) for key in keep_keys if key in row}
+            for row in top_primary_fields[:40]
             if isinstance(row, dict)
         ]
     buckets = field_scout.get("buckets")
@@ -2361,6 +3100,19 @@ def _experiment_plan_from_context(context: Dict[str, Any]) -> Dict[str, Any]:
     research_context = context.get("research_context") if isinstance(context, dict) else {}
     experiment_plan = research_context.get("experiment_plan") if isinstance(research_context, dict) else {}
     return dict(experiment_plan) if isinstance(experiment_plan, dict) else {}
+
+
+def _targeted_repair_requires_deep(context: Dict[str, Any] | None) -> bool:
+    experiment_plan = _experiment_plan_from_context(context or {})
+    targeted_repair = experiment_plan.get("targeted_repair")
+    if not isinstance(targeted_repair, dict) or not targeted_repair.get("active"):
+        return False
+    orchestration = str(targeted_repair.get("orchestration") or "").strip().lower()
+    return orchestration in {"deep_repair", "deep", "repair"}
+
+
+def _targeted_experiment_mode(mode: str) -> bool:
+    return str(mode or "").strip().lower() in {"optimize_best", "setting_sweep", "repair"}
 
 
 def _client_hard_timeout(client: Any) -> float:
@@ -2505,6 +3257,80 @@ def _is_trivial_expression(expression: str) -> bool:
     return len(operators) <= 2 and identifiers.issubset(basic_identifiers)
 
 
+def _parse_retry_after(value: Any, default: float = 1.0, maximum: float = 60.0) -> float:
+    """Parse an HTTP Retry-After header into a bounded sleep duration.
+
+    Per RFC 7231 the value may be either delay-seconds or an HTTP-date; a bare
+    float() crashes on the date form. Returns `default` when absent/unparseable,
+    clamped to [0, maximum] so a hostile/huge value can't stall the daemon.
+    """
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        try:
+            from email.utils import parsedate_to_datetime
+
+            when = parsedate_to_datetime(text)
+            if when is None:
+                return default
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return default
+    return max(0.0, min(seconds, maximum))
+
+
+def _correlation_response_summary(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"value": None, "min": None, "records": 0}
+
+    records = data.get("records") if isinstance(data.get("records"), list) else []
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    value = _finite_number(data.get("max"))
+    minimum = _finite_number(data.get("min"))
+    if value is None:
+        values = [
+            number
+            for row in results
+            if isinstance(row, dict)
+            for number in [_finite_number(row.get("correlation"))]
+            if number is not None
+        ]
+        if values:
+            value = max(values)
+    if value is None and records:
+        properties = (data.get("schema") or {}).get("properties", []) if isinstance(data.get("schema"), dict) else []
+        names = [str(item.get("name") or "") for item in properties if isinstance(item, dict)]
+        if "correlation" in names:
+            index = names.index("correlation")
+            values = [
+                number
+                for row in records
+                if isinstance(row, list) and index < len(row)
+                for number in [_finite_number(row[index])]
+                if number is not None
+            ]
+            if values:
+                value = max(values)
+    return {"value": value, "min": minimum, "records": len(records or results)}
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 class BrainHTTPClient:
     """HTTP adapter for WorldQuant BRAIN.
 
@@ -2517,12 +3343,16 @@ class BrainHTTPClient:
         session: Any | None = None,
         base_url: str = "https://api.worldquantbrain.com",
         max_poll_attempts: int = 5,
+        initial_poll_attempts: int | None = None,
+        resume_poll_attempts: int | None = None,
         sleep: Callable[[float], None] = time.sleep,
         request_timeout: float = 60.0,
     ):
         self.session = session or self._default_session()
         self.base_url = base_url.rstrip("/")
-        self.max_poll_attempts = max_poll_attempts
+        self.max_poll_attempts = max(1, int(max_poll_attempts))
+        self.initial_poll_attempts = max(1, int(initial_poll_attempts or self.max_poll_attempts))
+        self.resume_poll_attempts = max(1, int(resume_poll_attempts or self.max_poll_attempts))
         self.sleep = sleep
         self.request_timeout = max(1.0, float(request_timeout))
 
@@ -2530,6 +3360,9 @@ class BrainHTTPClient:
     def from_env(cls) -> "BrainHTTPClient":
         client = cls(
             base_url=os.environ.get("BRAIN_BASE_URL", "https://api.worldquantbrain.com"),
+            max_poll_attempts=int(os.environ.get("BRAIN_POLL_ATTEMPTS", "180")),
+            initial_poll_attempts=int(os.environ.get("BRAIN_INITIAL_POLL_ATTEMPTS", "3")),
+            resume_poll_attempts=int(os.environ.get("BRAIN_RESUME_POLL_ATTEMPTS", "3")),
             request_timeout=float(os.environ.get("BRAIN_REQUEST_TIMEOUT_SECONDS", "60")),
         )
         email, password = cls.credentials_from_env()
@@ -2597,13 +3430,20 @@ class BrainHTTPClient:
             raise RuntimeError(f"simulation creation failed: HTTP {response.status_code} {response.text[:200]}")
 
         location = response.headers["Location"]
-        alpha_id = self._poll_simulation_for_alpha(location)
+        alpha_id = self._poll_simulation_for_alpha(location, attempts=self.initial_poll_attempts)
         detail = self.get_alpha_detail(alpha_id)
         is_metrics = detail.get("is", {}) if isinstance(detail, dict) else {}
         checks = self.get_submission_check(alpha_id) or self._checks_from_alpha_detail(detail)
         return SimulationResult(alpha_id=alpha_id, metrics=is_metrics, checks=checks, raw={"detail": detail})
 
-    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure]:
+    def resume_simulation(self, location: str) -> SimulationResult:
+        alpha_id = self._poll_simulation_for_alpha(location, attempts=self.resume_poll_attempts)
+        detail = self.get_alpha_detail(alpha_id)
+        is_metrics = detail.get("is", {}) if isinstance(detail, dict) else {}
+        checks = self.get_submission_check(alpha_id) or self._checks_from_alpha_detail(detail)
+        return SimulationResult(alpha_id=alpha_id, metrics=is_metrics, checks=checks, raw={"detail": detail, "resumed": location})
+
+    def simulate_many(self, items: List[tuple[str, Dict[str, Any]]]) -> List[SimulationResult | SimulationFailure | SimulationPending]:
         if not items:
             return []
         if len(items) == 1:
@@ -2646,6 +3486,13 @@ class BrainHTTPClient:
                         },
                     )
                 )
+            except SimulationPendingError as exc:
+                results.append(
+                    SimulationPending(
+                        exc.location,
+                        raw={"multisimulation": parent_location, "child": child_location},
+                    )
+                )
             except Exception as exc:
                 results.append(
                     SimulationFailure(
@@ -2655,12 +3502,13 @@ class BrainHTTPClient:
                 )
         return results
 
-    def _poll_simulation_for_alpha(self, location: str) -> str:
-        for _ in range(self.max_poll_attempts):
+    def _poll_simulation_for_alpha(self, location: str, *, attempts: int | None = None) -> str:
+        max_attempts = max(1, int(attempts or self.max_poll_attempts))
+        for _ in range(max_attempts):
             response = self._get(self._absolute(location))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
-                self.sleep(float(retry_after))
+                self.sleep(_parse_retry_after(retry_after))
                 continue
             data = response.json()
             status = str(data.get("status") or "").upper() if isinstance(data, dict) else ""
@@ -2673,7 +3521,7 @@ class BrainHTTPClient:
             if alpha:
                 return str(alpha)
             self.sleep(1)
-        raise RuntimeError("simulation polling did not return an alpha id")
+        raise SimulationPendingError(location)
 
     def _poll_multisimulation_for_children(self, location: str) -> List[str]:
         attempts = int(os.environ.get("BRAIN_MULTI_POLL_ATTEMPTS", "200"))
@@ -2681,7 +3529,7 @@ class BrainHTTPClient:
             response = self._get(self._absolute(location))
             retry_after = response.headers.get("Retry-After")
             if retry_after:
-                self.sleep(float(retry_after))
+                self.sleep(_parse_retry_after(retry_after))
                 continue
             data = response.json()
             status = str(data.get("status") or "").upper() if isinstance(data, dict) else ""
@@ -2705,7 +3553,7 @@ class BrainHTTPClient:
                 return response.json()
             retry_after = response.headers.get("Retry-After")
             if response.status_code in {404, 425, 429, 500, 502, 503, 504} and attempt < self.max_poll_attempts:
-                self.sleep(float(retry_after) if retry_after else 1)
+                self.sleep(_parse_retry_after(retry_after, default=1.0))
                 continue
             break
         raise RuntimeError(f"alpha detail failed: HTTP {last_status}")
@@ -2716,7 +3564,7 @@ class BrainHTTPClient:
             post = self._post(f"{self.base_url}{path}")
             retry_after = post.headers.get("Retry-After")
             if retry_after:
-                self.sleep(float(retry_after))
+                self.sleep(_parse_retry_after(retry_after))
         except Exception:
             pass
 
@@ -2724,7 +3572,7 @@ class BrainHTTPClient:
             response = self._get(f"{self.base_url}{path}")
             retry_after = response.headers.get("Retry-After")
             if retry_after:
-                self.sleep(float(retry_after))
+                self.sleep(_parse_retry_after(retry_after))
                 continue
             data = response.json()
             if isinstance(data, list):
@@ -2737,6 +3585,71 @@ class BrainHTTPClient:
             return {}
         return {}
 
+    def get_alpha_correlations(self, alpha_id: str, threshold: float = 0.7) -> Dict[str, Dict[str, Any]]:
+        return {
+            "self": self._get_alpha_correlation(alpha_id, "self", "SELF_CORRELATION", threshold),
+            "production": self._get_alpha_correlation(alpha_id, "prod", "PROD_CORRELATION", threshold),
+        }
+
+    def _get_alpha_correlation(
+        self,
+        alpha_id: str,
+        endpoint: str,
+        check_name: str,
+        threshold: float,
+    ) -> Dict[str, Any]:
+        attempts = max(1, int(os.environ.get("BRAIN_CORRELATION_POLL_ATTEMPTS", "6")))
+        poll_seconds = max(0.0, float(os.environ.get("BRAIN_CORRELATION_POLL_SECONDS", "5")))
+        path = f"/alphas/{alpha_id}/correlations/{endpoint}"
+        last_status = 0
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self._get(f"{self.base_url}{path}")
+                last_status = int(response.status_code)
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    if attempt < attempts:
+                        self.sleep(_parse_retry_after(retry_after, default=poll_seconds, maximum=30.0))
+                        continue
+                    last_error = "platform correlation calculation is still pending"
+                    break
+                if response.status_code != 200:
+                    last_error = f"HTTP {response.status_code}"
+                else:
+                    try:
+                        data = response.json()
+                    except Exception as exc:
+                        data = {}
+                        last_error = f"invalid JSON: {exc}"
+                    summary = _correlation_response_summary(data)
+                    if summary["value"] is not None:
+                        value = float(summary["value"])
+                        return {
+                            "name": check_name,
+                            "status": "PASS" if value <= threshold else "FAIL",
+                            "value": value,
+                            "limit": threshold,
+                            "min": summary["min"],
+                            "records": summary["records"],
+                            "source": path,
+                            "http_status": response.status_code,
+                        }
+                    last_error = "platform returned no numeric correlation"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < attempts:
+                self.sleep(poll_seconds)
+        return {
+            "name": check_name,
+            "status": "UNCONFIRMED",
+            "value": None,
+            "limit": threshold,
+            "source": path,
+            "http_status": last_status or None,
+            "message": last_error or "platform correlation is unavailable",
+        }
+
     def submit_alpha(self, alpha_id: str, dry_run: bool = True) -> SubmitResult:
         if dry_run:
             return SubmitResult(alpha_id=alpha_id, submitted=False, stage="DRY_RUN", message="auto_submit disabled")
@@ -2745,13 +3658,27 @@ class BrainHTTPClient:
         if response.status_code not in (200, 201, 204):
             return SubmitResult(alpha_id=alpha_id, submitted=False, stage="REJECTED", message=f"HTTP {response.status_code}")
 
-        self.sleep(3)
-        detail = self.get_alpha_detail(alpha_id)
-        stage = str(detail.get("stage") or "")
-        date_submitted = detail.get("dateSubmitted")
-        if stage == "OS" and date_submitted:
-            return SubmitResult(alpha_id=alpha_id, submitted=True, stage=stage, message="verified OS")
-        return SubmitResult(alpha_id=alpha_id, submitted=False, stage=stage or "UNKNOWN", message="platform did not verify OS")
+        stage = ""
+        for attempt in range(1, self.max_poll_attempts + 1):
+            self.sleep(3 if attempt == 1 else 1)
+            detail = self.get_alpha_detail(alpha_id)
+            stage = str(detail.get("stage") or "")
+            date_submitted = detail.get("dateSubmitted")
+            if stage == "OS" and date_submitted:
+                return SubmitResult(alpha_id=alpha_id, submitted=True, stage=stage, message="verified OS")
+        return SubmitResult(
+            alpha_id=alpha_id,
+            submitted=False,
+            stage=stage or "UNKNOWN",
+            message="platform did not verify OS after polling",
+        )
+
+    def set_alpha_properties(self, alpha_id: str, **properties: Any) -> Dict[str, Any]:
+        payload = {key: value for key, value in properties.items() if value is not None}
+        response = self._request("patch", f"{self.base_url}/alphas/{alpha_id}", json=payload)
+        if response.status_code not in (200, 201):
+            raise RuntimeError(f"alpha property update failed: HTTP {response.status_code} {response.text[:200]}")
+        return response.json()
 
     def count_submitted_alphas(self, start_date: str, end_date: str) -> int:
         response = self._get(
@@ -2873,7 +3800,7 @@ class BrainHTTPClient:
                 return response
             retry_after = response.headers.get("Retry-After")
             try:
-                wait_seconds = min(float(retry_after), 30.0)
+                wait_seconds = _parse_retry_after(retry_after, default=5.0, maximum=30.0)
             except (TypeError, ValueError):
                 wait_seconds = 5.0
             self.sleep(wait_seconds)

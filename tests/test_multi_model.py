@@ -148,6 +148,33 @@ class FakeGenerator:
         ]
 
 
+class DuplicateThenUniqueGenerator(FakeGenerator):
+    def generate_candidates(self, batch_size, context):
+        self.calls.append((batch_size, context))
+        profile_offset = sum(ord(char) for char in self.profile_name) % 50
+        if len(self.calls) == 1:
+            expression = f"rank(ts_mean(close,{profile_offset + 20}))"
+            return [
+                CandidateSpec(
+                    expression=expression,
+                    settings={"region": context.get("region", "USA"), "delay": context.get("delay", 1)},
+                    source=f"model:{self.profile_name}",
+                    metadata={"model_profile": self.profile_name, "model": self.model},
+                )
+                for _idx in range(batch_size)
+            ]
+        refill_offset = profile_offset + 100 * len(self.calls)
+        return [
+            CandidateSpec(
+                expression=f"rank(ts_mean(close,{refill_offset + idx + 20}))",
+                settings={"region": context.get("region", "USA"), "delay": context.get("delay", 1)},
+                source=f"model:{self.profile_name}",
+                metadata={"model_profile": self.profile_name, "model": self.model},
+            )
+            for idx in range(batch_size)
+        ]
+
+
 class FailingGenerator:
     def __init__(self, profile_name, model, error):
         self.profile_name = profile_name
@@ -193,6 +220,46 @@ class BatchLimitedGenerator(FakeGenerator):
         ]
 
 
+class InvalidThenValidGenerator(FakeGenerator):
+    def generate_candidates(self, batch_size, context):
+        self.calls.append((batch_size, context))
+        if len(self.calls) == 1:
+            return [
+                CandidateSpec(
+                    expression="group_mean(ts_mean(close,22),industry)",
+                    settings={"region": context.get("region", "USA"), "delay": context.get("delay", 1)},
+                    source=f"model:{self.profile_name}",
+                    metadata={"model_profile": self.profile_name, "model": self.model},
+                )
+            ]
+        return [
+            CandidateSpec(
+                expression="rank(ts_mean(close,22))",
+                settings={"region": context.get("region", "USA"), "delay": context.get("delay", 1)},
+                source=f"model:{self.profile_name}",
+                metadata={"model_profile": self.profile_name, "model": self.model},
+            )
+        ]
+
+
+class RawVectorGenerator(FakeGenerator):
+    def generate_candidates(self, batch_size, context):
+        self.calls.append((batch_size, context))
+        return [
+            CandidateSpec(
+                expression=(
+                    "rank(if_else(greater(normalize(anl83_analyst_fkgl_qa),"
+                    "normalize(anl83_ceo_forw_sent_pres)),"
+                    "normalize(anl83_analyst_pos_logit_qa),"
+                    "multiply(-1,normalize(anl83_cfo_sent_score_qa))))"
+                ),
+                settings={"region": context.get("region", "USA"), "delay": context.get("delay", 1)},
+                source=f"model:{self.profile_name}",
+                metadata={"model_profile": self.profile_name, "model": self.model},
+            )
+        ]
+
+
 class FakeValidator:
     profile_name = "cheap-check"
     model = "gpt-5.4-nano"
@@ -228,6 +295,169 @@ class DropFirstPassValidator(FakeValidator):
 
 
 class MultiModelTests(unittest.TestCase):
+    def test_multi_model_from_env_defaults_to_lean_personal_orchestration(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AI_API_KEY": "shared-key",
+                "AI_BASE_URL": "https://relay.example/v1",
+                "AI_MODEL_PROFILES": (
+                    "grok-4-1-fast-reasoning@controller,"
+                    "gemini-3-flash-free@generator,"
+                    "glm-4.5@optimizer,"
+                    "gpt-5.4-nano@validator"
+                ),
+            },
+            clear=True,
+        ):
+            client = MultiModelAIClient.from_env()
+
+        self.assertEqual(client.orchestration_mode, "lean")
+        self.assertEqual(client.max_active_generators, 1)
+
+    def test_lean_orchestration_skips_controller_validator_and_uses_one_generator(self):
+        controller = FakeController({"allocation": {"gemini": 3, "glm": 2}})
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free")
+        glm = FakeGenerator("glm", "glm-4.5")
+        validator = FakeValidator()
+        client = MultiModelAIClient(
+            controllers=[controller],
+            generators=[gemini, glm],
+            validators=[validator],
+            orchestration_mode="lean",
+            max_active_generators=1,
+        )
+
+        candidates = client.generate_candidates(
+            5,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {"experiment_plan": {"mode": "fresh_exploration"}},
+            },
+        )
+
+        self.assertEqual(controller.calls, [])
+        self.assertEqual(validator.calls, [])
+        self.assertEqual(gemini.calls[0][0], 5)
+        self.assertEqual(glm.calls, [])
+        self.assertEqual(len(candidates), 5)
+        self.assertEqual(client.last_plan["controller"], "lean")
+        self.assertEqual(client.last_plan["allocation"], {"gemini": 5})
+        self.assertTrue(all(candidate.metadata["orchestrated_by"] == "lean" for candidate in candidates))
+
+    def test_lean_orchestration_rotates_to_less_used_generator(self):
+        gemini = FakeGenerator("G-1", "DeepSeek-V4-Pro")
+        kimi = FakeGenerator("G-2", "Kimi-K2.6")
+        client = MultiModelAIClient(
+            generators=[gemini, kimi],
+            orchestration_mode="lean",
+            max_active_generators=1,
+        )
+
+        candidates = client.generate_candidates(
+            6,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {"mode": "explore_new_family"},
+                    "active_run_history_memory": {
+                        "profile_outcomes": {
+                            "G-1": {"generated": 20, "failed": 18},
+                            "G-2": {"generated": 2, "failed": 1},
+                        }
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(gemini.calls, [])
+        self.assertEqual(kimi.calls[0][0], 6)
+        self.assertEqual(client.last_plan["allocation"], {"G-2": 6})
+        self.assertTrue(all(candidate.source == "model:G-2" for candidate in candidates))
+
+    def test_targeted_repair_keeps_lean_personal_orchestration_under_lean_default(self):
+        controller = FakeController({"allocation": {"gemini": 2, "glm": 2}})
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free")
+        glm = FakeGenerator("glm", "glm-4.5")
+        validator = FakeValidator()
+        client = MultiModelAIClient(
+            controllers=[controller],
+            generators=[gemini, glm],
+            validators=[validator],
+            orchestration_mode="lean",
+            max_active_generators=1,
+            targeted_repair_generators=2,
+        )
+
+        candidates = client.generate_candidates(
+            4,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "optimize_best",
+                        "targeted_repair": {"active": True, "orchestration": "deep_repair"},
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(controller.calls, [])
+        self.assertEqual(validator.calls, [])
+        self.assertEqual(gemini.calls[0][0], 4)
+        self.assertEqual(glm.calls, [])
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(client.last_plan["controller"], "lean")
+        self.assertEqual(client.last_plan["allocation"], {"gemini": 4})
+        self.assertTrue(all(candidate.metadata["orchestrated_by"] == "lean" for candidate in candidates))
+
+    def test_targeted_repair_can_use_deep_orchestration_when_explicitly_enabled(self):
+        controller = FakeController({"allocation": {"gemini": 2, "glm": 2}})
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free")
+        glm = FakeGenerator("glm", "glm-4.5")
+        validator = FakeValidator()
+        client = MultiModelAIClient(
+            controllers=[controller],
+            generators=[gemini, glm],
+            validators=[validator],
+            orchestration_mode="deep",
+            max_active_generators=1,
+            targeted_repair_generators=2,
+        )
+
+        candidates = client.generate_candidates(
+            4,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "optimize_best",
+                        "targeted_repair": {"active": True, "orchestration": "deep_repair"},
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(len(controller.calls), 1)
+        self.assertEqual(len(validator.calls), 1)
+        self.assertEqual(gemini.calls[0][0], 2)
+        self.assertEqual(glm.calls[0][0], 2)
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(client.last_plan["controller"], "flow")
+        self.assertEqual(client.last_plan["allocation"], {"gemini": 2, "glm": 2})
+        self.assertTrue(all(candidate.metadata["orchestrated_by"] == "flow" for candidate in candidates))
+
+    def test_default_profile_file_excludes_known_unavailable_models(self):
+        profiles_path = Path(__file__).resolve().parents[1] / "config" / "ai_model_profiles.json"
+        profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        models = {str(profile.get("model") or "") for profile in profiles}
+
+        self.assertNotIn("gpt-5.3-codex-A", models)
+
     def test_parse_model_profiles_from_compact_env_uses_default_relay_credentials(self):
         with patch.dict(
             os.environ,
@@ -480,6 +710,141 @@ class MultiModelTests(unittest.TestCase):
         self.assertEqual(client.last_plan["intra_round_repair"]["refill_allocation"], {"glm": 3})
         self.assertTrue(any(candidate.metadata.get("intra_round_repair") for candidate in candidates))
 
+    def test_multi_model_client_refills_when_all_candidates_fail_local_preflight(self):
+        controller = RepairingController(
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "initial family"}}},
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "final family"}}},
+            {"action": "accept", "rationale": "no accepted candidates"},
+        )
+        generator = InvalidThenValidGenerator("gemini", "gemini-3-flash-free")
+        client = MultiModelAIClient(controllers=[controller], generators=[generator])
+
+        candidates = client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {"experiment_plan": {"mode": "explore_new_family"}},
+            },
+        )
+
+        self.assertEqual([candidate.expression for candidate in candidates], ["rank(ts_mean(close,22))"])
+        self.assertEqual([call[0] for call in generator.calls], [1, 1])
+        self.assertEqual(client.last_plan["intra_round_repair"]["action"], "refill")
+        self.assertEqual(client.last_plan["intra_round_repair"]["reason"], "empty_local_preflight_batch")
+        self.assertTrue(candidates[0].metadata.get("intra_round_repair"))
+
+    def test_multi_model_client_locally_repairs_raw_vector_candidate_before_ai_refill(self):
+        controller = RepairingController(
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "analyst83 route"}}},
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "analyst83 route"}}},
+            {"action": "refill", "allocation": {"gemini": 1}, "rationale": "fallback refill"},
+        )
+        generator = RawVectorGenerator("gemini", "gemini-3-flash-free")
+        client = MultiModelAIClient(controllers=[controller], generators=[generator])
+
+        candidates = client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {"mode": "explore_new_family"},
+                    "datafields": {
+                        "field_ids": [
+                            "anl83_analyst_fkgl_qa",
+                            "anl83_ceo_forw_sent_pres",
+                            "anl83_analyst_pos_logit_qa",
+                            "anl83_cfo_sent_score_qa",
+                        ],
+                        "field_types": {
+                            "anl83_analyst_fkgl_qa": "VECTOR",
+                            "anl83_ceo_forw_sent_pres": "VECTOR",
+                            "anl83_analyst_pos_logit_qa": "VECTOR",
+                            "anl83_cfo_sent_score_qa": "VECTOR",
+                        },
+                        "fields": [
+                            {"id": "anl83_analyst_fkgl_qa", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_ceo_forw_sent_pres", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_analyst_pos_logit_qa", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_cfo_sent_score_qa", "type": "VECTOR", "category": "Analyst"},
+                        ],
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("normalize(vec_avg(anl83_analyst_fkgl_qa))", candidates[0].expression)
+        self.assertIn("normalize(vec_avg(anl83_ceo_forw_sent_pres))", candidates[0].expression)
+        self.assertEqual([call[0] for call in generator.calls], [1])
+        self.assertEqual(controller.repair_calls, [])
+        self.assertEqual(client.last_plan["intra_round_repair"]["action"], "local_vector_repair")
+        self.assertTrue(candidates[0].metadata.get("local_preflight_repair"))
+
+    def test_multi_model_client_locally_repairs_raw_vector_candidate_without_controller(self):
+        generator = RawVectorGenerator("gemini", "gemini-3-flash-free")
+        client = MultiModelAIClient(generators=[generator])
+
+        candidates = client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {"mode": "explore_new_family"},
+                    "datafields": {
+                        "field_ids": [
+                            "anl83_analyst_fkgl_qa",
+                            "anl83_ceo_forw_sent_pres",
+                            "anl83_analyst_pos_logit_qa",
+                            "anl83_cfo_sent_score_qa",
+                        ],
+                        "field_types": {
+                            "anl83_analyst_fkgl_qa": "VECTOR",
+                            "anl83_ceo_forw_sent_pres": "VECTOR",
+                            "anl83_analyst_pos_logit_qa": "VECTOR",
+                            "anl83_cfo_sent_score_qa": "VECTOR",
+                        },
+                        "fields": [
+                            {"id": "anl83_analyst_fkgl_qa", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_ceo_forw_sent_pres", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_analyst_pos_logit_qa", "type": "VECTOR", "category": "Analyst"},
+                            {"id": "anl83_cfo_sent_score_qa", "type": "VECTOR", "category": "Analyst"},
+                        ],
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("normalize(vec_avg(anl83_analyst_fkgl_qa))", candidates[0].expression)
+        self.assertEqual(client.last_plan["intra_round_repair"]["action"], "local_vector_repair")
+        self.assertTrue(candidates[0].metadata.get("local_preflight_repair"))
+
+    def test_multi_model_client_respects_explicit_abandon_after_empty_local_preflight(self):
+        controller = RepairingController(
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "initial family"}}},
+            {"mode": "explore", "profile_guidance": {"gemini": {"objective": "final family"}}},
+            {"action": "abandon", "rationale": "leave the slot empty"},
+        )
+        generator = InvalidThenValidGenerator("gemini", "gemini-3-flash-free")
+        client = MultiModelAIClient(controllers=[controller], generators=[generator])
+
+        candidates = client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {"experiment_plan": {"mode": "explore_new_family"}},
+            },
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual([call[0] for call in generator.calls], [1])
+        self.assertEqual(client.last_plan["intra_round_repair"]["action"], "abandon")
+        self.assertNotIn("reason", client.last_plan["intra_round_repair"])
+
     def test_multi_model_client_keeps_balanced_allocation_for_optimization(self):
         gemini = FakeGenerator("gemini", "gemini-3-flash-free")
         glm = FakeGenerator("glm", "glm-4.5", role="optimizer")
@@ -496,6 +861,32 @@ class MultiModelTests(unittest.TestCase):
 
         self.assertEqual(gemini.calls[0][0], 4)
         self.assertEqual(glm.calls[0][0], 4)
+
+    def test_multi_model_client_refills_balanced_lean_batch_after_filtering(self):
+        gemini = DuplicateThenUniqueGenerator("gemini", "gemini-3-flash-free")
+        glm = DuplicateThenUniqueGenerator("glm", "glm-4.5")
+        client = MultiModelAIClient(
+            generators=[gemini, glm],
+            orchestration_mode="lean",
+            max_active_generators=0,
+        )
+
+        candidates = client.generate_candidates(
+            8,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {"experiment_plan": {"mode": "explore_new_family"}},
+            },
+        )
+
+        self.assertEqual(len(candidates), 8)
+        self.assertEqual([call[0] for call in gemini.calls], [4, 3])
+        self.assertEqual([call[0] for call in glm.calls], [4, 3])
+        self.assertEqual(client.last_plan["allocation"], {"gemini": 4, "glm": 4})
+        self.assertEqual(client.last_plan["intra_round_repair"]["action"], "refill")
+        self.assertEqual(client.last_plan["intra_round_repair"]["reason"], "balanced_lean_underfilled")
+        self.assertEqual(client.last_plan["intra_round_repair"]["final_count"], 8)
 
     def test_multi_model_client_does_not_give_optimizer_extra_allocation(self):
         gemini = FakeGenerator("gemini", "gemini-3-flash-free", role="generator")
@@ -579,6 +970,47 @@ class MultiModelTests(unittest.TestCase):
         self.assertEqual(len(candidates), 8)
         self.assertEqual(client.last_plan["allocation"], {"gemini": 4, "glm": 4})
         self.assertEqual(client.last_plan["profile_guidance"]["glm"]["objective"], "revision family")
+
+    def test_multi_model_client_does_not_inject_profile_guidance_into_optimize_generators(self):
+        controller = FakeController(
+            {
+                "mode": "explore",
+                "profile_guidance": {
+                    "gemini": {
+                        "objective": "fresh NEWS route",
+                        "field_family": "NEWS primary only",
+                    },
+                    "glm": {
+                        "objective": "fresh RISK route",
+                        "field_family": "RISK primary only",
+                    },
+                },
+            }
+        )
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free", role="generator")
+        glm = FakeGenerator("glm", "gpt-5.4-pro", role="generator")
+        client = MultiModelAIClient(controllers=[controller], generators=[gemini, glm])
+
+        candidates = client.generate_candidates(
+            4,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "optimize_best",
+                        "target_candidate_id": 9906,
+                        "target_expression": "rank(ts_decay_linear(ts_backfill(vec_avg(fnd23_significance), 120), 20))",
+                        "keep": ["fnd23_significance"],
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(client.last_plan["profile_guidance"]["gemini"]["field_family"], "NEWS primary only")
+        self.assertNotIn("profile_guidance", gemini.calls[0][1]["research_context"])
+        self.assertNotIn("profile_guidance", glm.calls[0][1]["research_context"])
+        self.assertFalse(any("profile_guidance" in candidate.metadata for candidate in candidates))
 
     def test_multi_model_client_fallback_splits_exploration_between_generator_and_optimizer(self):
         gemini = FakeGenerator("gemini", "gemini-3-flash-free", role="generator")
@@ -841,6 +1273,275 @@ class MultiModelTests(unittest.TestCase):
 
         self.assertEqual(len(validated), 2)
         self.assertEqual([candidate.settings["decay"] for candidate in validated], [0, 6])
+
+    def test_multi_model_validator_applies_local_preflight_field_type_filter(self):
+        validator = FakeValidator()
+        client = MultiModelAIClient(validators=[validator])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 0}
+        invalid = CandidateSpec(
+            "rank(ts_mean(vector_signal, 20))",
+            settings=settings,
+            source="model:G-2",
+        )
+        valid = CandidateSpec(
+            "rank(ts_mean(vec_avg(vector_signal), 20))",
+            settings=settings,
+            source="model:G-1",
+        )
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "datafields": {
+                    "field_ids": ["vector_signal"],
+                    "field_types": {"vector_signal": "VECTOR"},
+                    "fields": [{"id": "vector_signal", "type": "VECTOR", "category": "Alternative"}],
+                },
+                "syntax_constraints": {"auxiliary_only_fields": []},
+            },
+        }
+
+        validated = client.validate_candidate_specs([invalid, valid], 2, context)
+
+        self.assertEqual([candidate.expression for candidate in validated], [valid.expression])
+        self.assertEqual(len(client.last_validator_rejections), 1)
+        self.assertIn("LOCAL_PREFLIGHT", client.last_validator_rejections[0]["reason"])
+        self.assertIn("INVALID_VECTOR_TS_OPERATOR:ts_mean:vector_signal", client.last_validator_rejections[0]["reason"])
+
+    def test_multi_model_validator_rejects_raw_high_turnover_alternative_fields(self):
+        validator = FakeValidator()
+        client = MultiModelAIClient(validators=[validator])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 0}
+        invalid = CandidateSpec(
+            "normalize(divide(snt23_5dts_gen_305,add(1,abs(snt23_5pos_max_297))))",
+            settings=settings,
+            source="model:G-2",
+        )
+        valid = CandidateSpec(
+            "rank(ts_mean(snt23_5dts_gen_305, 20))",
+            settings=settings,
+            source="model:G-1",
+        )
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "experiment_plan": {"mode": "explore_new_family"},
+                "datafields": {
+                    "field_ids": ["snt23_5dts_gen_305", "snt23_5pos_max_297"],
+                    "field_types": {"snt23_5dts_gen_305": "MATRIX", "snt23_5pos_max_297": "MATRIX"},
+                    "fields": [
+                        {"id": "snt23_5dts_gen_305", "type": "MATRIX", "category": "Sentiment", "dataset_id": "sentiment23"},
+                        {"id": "snt23_5pos_max_297", "type": "MATRIX", "category": "Sentiment", "dataset_id": "sentiment23"},
+                    ],
+                },
+                "syntax_constraints": {"auxiliary_only_fields": []},
+            },
+        }
+
+        validated = client.validate_candidate_specs([invalid, valid], 2, context)
+
+        self.assertEqual([candidate.expression for candidate in validated], [valid.expression])
+        self.assertEqual(len(client.last_validator_rejections), 1)
+        self.assertIn("HIGH_TURNOVER_RAW_FIELD:snt23_5dts_gen_305", client.last_validator_rejections[0]["reason"])
+
+    def test_multi_model_validator_rejects_profile_family_mismatch_locally(self):
+        client = MultiModelAIClient(validators=[])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 0}
+        invalid = CandidateSpec(
+            "rank(add(normalize(vec_avg(conference_analyst_attendees)),multiply(-1,normalize(vec_avg(anl83_numwordoperqa)))))",
+            settings=settings,
+            source="model:G-1",
+            metadata={
+                "model_profile": "G-1",
+                "profile_guidance": {
+                    "field_family": "ANALYST primary only, using fresh field_scout names/buckets",
+                    "avoid": ["non-analyst primaries", "news fields"],
+                },
+            },
+        )
+        valid = CandidateSpec(
+            "rank(ts_mean(anl83_numwordoperqa,20))",
+            settings=settings,
+            source="model:G-1",
+            metadata={
+                "model_profile": "G-1",
+                "profile_guidance": {
+                    "field_family": "ANALYST primary only, using fresh field_scout names/buckets",
+                    "avoid": ["non-analyst primaries", "news fields"],
+                },
+            },
+        )
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "datafields": {
+                    "field_ids": ["conference_analyst_attendees", "anl83_numwordoperqa"],
+                    "field_types": {
+                        "conference_analyst_attendees": "VECTOR",
+                        "anl83_numwordoperqa": "MATRIX",
+                    },
+                    "fields": [
+                        {
+                            "id": "conference_analyst_attendees",
+                            "type": "VECTOR",
+                            "category": "Other",
+                            "dataset_id": "other384",
+                        },
+                        {
+                            "id": "anl83_numwordoperqa",
+                            "type": "MATRIX",
+                            "category": "Analyst",
+                            "dataset_id": "analyst83",
+                        },
+                    ],
+                },
+                "syntax_constraints": {"auxiliary_only_fields": []},
+            },
+        }
+
+        validated = client.validate_candidate_specs([invalid, valid], 2, context)
+
+        self.assertEqual([candidate.expression for candidate in validated], [valid.expression])
+        self.assertEqual(len(client.last_validator_rejections), 1)
+        self.assertIn("PROFILE_REQUIRED_FIELD_FAMILY:ANALYST", client.last_validator_rejections[0]["reason"])
+
+    def test_multi_model_generator_context_includes_profile_family_field_ids(self):
+        generator = FakeGenerator("G-1", "gpt-5.3-codex-A")
+        client = MultiModelAIClient(generators=[generator])
+        client.last_plan = {
+            "profile_guidance": {
+                "G-1": {
+                    "field_family": "ANALYST primary only, using fresh field_scout names/buckets",
+                    "avoid": ["non-analyst primaries"],
+                }
+            }
+        }
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "datafields": {
+                    "field_ids": ["conference_analyst_attendees", "anl83_numwordoperqa"],
+                    "field_types": {
+                        "conference_analyst_attendees": "VECTOR",
+                        "anl83_numwordoperqa": "MATRIX",
+                    },
+                    "fields": [
+                        {
+                            "id": "conference_analyst_attendees",
+                            "type": "VECTOR",
+                            "category": "Other",
+                            "dataset_id": "other384",
+                        },
+                        {
+                            "id": "anl83_numwordoperqa",
+                            "type": "MATRIX",
+                            "category": "Analyst",
+                            "dataset_id": "analyst83",
+                        },
+                    ],
+                }
+            },
+        }
+
+        generator_context = client._context_for_generator(generator, context)
+        research_context = generator_context["research_context"]
+
+        self.assertEqual(research_context["profile_family_field_ids"], ["anl83_numwordoperqa"])
+        self.assertEqual(research_context["profile_family_policy"]["required_family"], "ANALYST")
+
+    def test_multi_model_validator_prioritizes_candidates_by_quality_budget_slots(self):
+        client = MultiModelAIClient(validators=[])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 0}
+        broad = CandidateSpec("rank(ts_mean(broad_signal,20))", settings=settings, source="model:G-1")
+        exploit = CandidateSpec("rank(ts_mean(anl10_recovery_signal,20))", settings=settings, source="model:G-1")
+        probe = CandidateSpec("rank(ts_mean(mdl262_fresh_signal,20))", settings=settings, source="model:G-1")
+        broad_two = CandidateSpec("rank(ts_mean(other_broad_signal,20))", settings=settings, source="model:G-1")
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "experiment_plan": {
+                    "quality_budget": {
+                        "slots": {"exploit_positive_evidence": 1, "probe_new_fields": 1, "broad_explore": 1},
+                        "exploit_fields": ["anl10_recovery_signal"],
+                    },
+                    "probe_recommendations": [{"field": "mdl262_fresh_signal"}],
+                },
+                "datafields": {
+                    "field_ids": [
+                        "broad_signal",
+                        "anl10_recovery_signal",
+                        "mdl262_fresh_signal",
+                        "other_broad_signal",
+                    ],
+                    "field_types": {
+                        "broad_signal": "MATRIX",
+                        "anl10_recovery_signal": "MATRIX",
+                        "mdl262_fresh_signal": "MATRIX",
+                        "other_broad_signal": "MATRIX",
+                    },
+                    "fields": [
+                        {"id": "broad_signal", "type": "MATRIX", "category": "Model"},
+                        {"id": "anl10_recovery_signal", "type": "MATRIX", "category": "Analyst"},
+                        {"id": "mdl262_fresh_signal", "type": "MATRIX", "category": "Model"},
+                        {"id": "other_broad_signal", "type": "MATRIX", "category": "Model"},
+                    ],
+                },
+                "syntax_constraints": {"auxiliary_only_fields": []},
+            },
+        }
+
+        validated = client.validate_candidate_specs([broad, exploit, probe, broad_two], 3, context)
+
+        self.assertEqual(
+            [candidate.expression for candidate in validated],
+            [exploit.expression, probe.expression, broad.expression],
+        )
+
+    def test_multi_model_validator_does_not_backfill_broad_candidates_during_production_rescue(self):
+        client = MultiModelAIClient(validators=[])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 0}
+        broad = CandidateSpec("rank(ts_mean(anl4_weak_signal,20))", settings=settings, source="model:G-1")
+        probe = CandidateSpec("group_rank(ts_rank(mdl262_predictive_signal,63),industry)", settings=settings, source="model:G-1")
+        context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "experiment_plan": {
+                    "production_rescue": {"active": True},
+                    "quality_budget": {
+                        "slots": {"probe_new_fields": 8},
+                        "exploit_fields": [],
+                    },
+                    "probe_recommendations": [{"field": "mdl262_predictive_signal"}],
+                },
+                "datafields": {
+                    "field_ids": ["anl4_weak_signal", "mdl262_predictive_signal"],
+                    "field_types": {
+                        "anl4_weak_signal": "MATRIX",
+                        "mdl262_predictive_signal": "MATRIX",
+                    },
+                    "fields": [
+                        {"id": "anl4_weak_signal", "type": "MATRIX", "category": "Analyst"},
+                        {"id": "mdl262_predictive_signal", "type": "MATRIX", "category": "Model"},
+                    ],
+                },
+                "syntax_constraints": {"auxiliary_only_fields": []},
+            },
+        }
+
+        validated = client.validate_candidate_specs([broad, probe], 8, context)
+
+        self.assertEqual([candidate.expression for candidate in validated], [probe.expression])
 
 
 if __name__ == "__main__":

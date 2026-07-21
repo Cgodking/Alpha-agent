@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from alpha.clients import BrainHTTPClient, OpenAICompatibleAIClient
-from alpha.models import SimulationFailure
+from alpha.models import SimulationFailure, SimulationPending, SimulationPendingError
 
 
 class FakeResponse:
@@ -47,6 +47,11 @@ class FakeSession:
         path = url.replace("https://api.worldquantbrain.com", "")
         self.calls.append(("GET", path, kwargs))
         return self._response("GET", path)
+
+    def patch(self, url, **kwargs):
+        path = url.replace("https://api.worldquantbrain.com", "")
+        self.calls.append(("PATCH", path, kwargs))
+        return self._response("PATCH", path)
 
 
 class LiveAdapterTests(unittest.TestCase):
@@ -102,6 +107,54 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(result.metrics["sharpe"], 2.0)
         self.assertEqual(result.checks["PROD_CORRELATION"]["status"], "PASS")
         self.assertEqual(session.calls[0][0:2], ("POST", "/simulations"))
+
+    def test_brain_http_client_reads_dedicated_correlation_endpoints_without_posting_check(self):
+        session = FakeSession()
+        session.route(
+            "GET",
+            "/alphas/abc123/correlations/self",
+            FakeResponse(200, {"max": 0.42, "min": -0.15, "records": [["a", 0.42]]}),
+        )
+        session.route(
+            "GET",
+            "/alphas/abc123/correlations/prod",
+            FakeResponse(200, {"max": 0.81, "min": -0.2, "records": [["b", 0.81]]}),
+        )
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        result = client.get_alpha_correlations("abc123")
+
+        self.assertEqual(result["self"]["value"], 0.42)
+        self.assertEqual(result["self"]["status"], "PASS")
+        self.assertEqual(result["production"]["value"], 0.81)
+        self.assertEqual(result["production"]["status"], "FAIL")
+        self.assertFalse(any(method == "POST" for method, _path, _kwargs in session.calls))
+
+    def test_brain_http_client_polls_correlation_retry_after_and_parses_schema_records(self):
+        session = FakeSession()
+        schema = {"properties": [{"name": "alpha"}, {"name": "correlation"}]}
+        session.route(
+            "GET",
+            "/alphas/abc123/correlations/self",
+            [
+                FakeResponse(200, {}, headers={"Retry-After": "0"}),
+                FakeResponse(200, {"schema": schema, "records": [["old", 0.66]]}),
+            ],
+        )
+        session.route(
+            "GET",
+            "/alphas/abc123/correlations/prod",
+            FakeResponse(200, {"schema": schema, "records": [["prod", 0.55]]}),
+        )
+        sleeps = []
+        client = BrainHTTPClient(session=session, sleep=sleeps.append)
+
+        with patch.dict(os.environ, {"BRAIN_CORRELATION_POLL_ATTEMPTS": "2"}):
+            result = client.get_alpha_correlations("abc123")
+
+        self.assertEqual(result["self"]["value"], 0.66)
+        self.assertEqual(result["production"]["value"], 0.55)
+        self.assertEqual(sleeps, [0.0])
 
     def test_brain_http_client_uses_multisimulation_for_candidate_batches(self):
         session = FakeSession()
@@ -234,6 +287,68 @@ class LiveAdapterTests(unittest.TestCase):
 
         self.assertIn("Unknown variable", str(ctx.exception))
 
+    def test_brain_http_client_poll_error_includes_location(self):
+        session = FakeSession()
+        session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/slow"}))
+        session.route("GET", "/simulations/slow", FakeResponse(200, {"status": "COMPLETE"}))
+        client = BrainHTTPClient(session=session, max_poll_attempts=1, sleep=lambda _seconds: None)
+
+        with self.assertRaises(SimulationPendingError) as ctx:
+            client.simulate("rank(close)", {"region": "USA"})
+
+        self.assertIn("location=/simulations/slow", str(ctx.exception))
+        self.assertEqual(ctx.exception.location, "/simulations/slow")
+
+    def test_brain_http_client_uses_short_initial_poll_limit(self):
+        session = FakeSession()
+        session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/slow"}))
+        session.route("GET", "/simulations/slow", FakeResponse(200, {"status": "RUNNING"}))
+        client = BrainHTTPClient(
+            session=session,
+            max_poll_attempts=180,
+            initial_poll_attempts=1,
+            sleep=lambda _seconds: None,
+        )
+
+        with self.assertRaises(SimulationPendingError):
+            client.simulate("rank(close)", {"region": "USA"})
+
+        get_calls = [call for call in session.calls if call[0:2] == ("GET", "/simulations/slow")]
+        self.assertEqual(len(get_calls), 1)
+
+    def test_brain_http_client_uses_short_resume_poll_limit(self):
+        session = FakeSession()
+        session.route("GET", "/simulations/slow", FakeResponse(200, {"status": "RUNNING"}))
+        client = BrainHTTPClient(
+            session=session,
+            max_poll_attempts=180,
+            resume_poll_attempts=1,
+            sleep=lambda _seconds: None,
+        )
+
+        with self.assertRaises(SimulationPendingError):
+            client.resume_simulation("/simulations/slow")
+
+        get_calls = [call for call in session.calls if call[0:2] == ("GET", "/simulations/slow")]
+        self.assertEqual(len(get_calls), 1)
+
+    def test_brain_http_client_returns_pending_multisimulation_child(self):
+        session = FakeSession()
+        session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/multi"}))
+        session.route("GET", "/simulations/multi", FakeResponse(200, {"children": ["child1", "child2"]}))
+        session.route("GET", "/simulations/child1", FakeResponse(200, {"status": "COMPLETE"}))
+        session.route("GET", "/simulations/child2", FakeResponse(200, {"alpha": "alpha2"}))
+        session.route("GET", "/alphas/alpha2", FakeResponse(200, {"is": {"sharpe": 2.0, "fitness": 1.1}}))
+        session.route("POST", "/alphas/alpha2/check", FakeResponse(200, headers={}))
+        session.route("GET", "/alphas/alpha2/check", FakeResponse(200, {}))
+        client = BrainHTTPClient(session=session, max_poll_attempts=1, sleep=lambda _seconds: None)
+
+        results = client.simulate_many([("rank(close)", {"region": "USA"}), ("rank(open)", {"region": "USA"})])
+
+        self.assertIsInstance(results[0], SimulationPending)
+        self.assertEqual(results[0].location, "/simulations/child1")
+        self.assertEqual(results[1].alpha_id, "alpha2")
+
     def test_brain_http_client_uses_alpha_detail_tests_when_check_endpoint_is_empty(self):
         session = FakeSession()
         session.route("POST", "/simulations", FakeResponse(201, headers={"Location": "/simulations/2"}))
@@ -310,6 +425,26 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertTrue(result.submitted)
         self.assertEqual(result.stage, "OS")
 
+    def test_brain_http_submit_polls_until_platform_verifies_os(self):
+        session = FakeSession()
+        session.route("POST", "/alphas/abc123/submit", FakeResponse(201, {}))
+        session.route(
+            "GET",
+            "/alphas/abc123",
+            [
+                FakeResponse(200, {"stage": "IS", "dateSubmitted": None}),
+                FakeResponse(200, {"stage": "OS", "dateSubmitted": "2026-06-30T11:26:10-04:00"}),
+            ],
+        )
+        client = BrainHTTPClient(session=session, max_poll_attempts=3, sleep=lambda _seconds: None)
+
+        result = client.submit_alpha("abc123", dry_run=False)
+
+        detail_calls = [call for call in session.calls if call[:2] == ("GET", "/alphas/abc123")]
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.stage, "OS")
+        self.assertEqual(len(detail_calls), 2)
+
     def test_brain_http_submit_rejects_when_platform_does_not_move_to_os(self):
         session = FakeSession()
         session.route("POST", "/alphas/abc123/submit", FakeResponse(201, {}))
@@ -334,6 +469,18 @@ class LiveAdapterTests(unittest.TestCase):
         self.assertEqual(kwargs["params"]["stage"], "OS")
         self.assertEqual(kwargs["params"]["dateSubmitted>"], "2026-04-29T00:00:00Z")
         self.assertEqual(kwargs["params"]["dateSubmitted<"], "2026-04-30T00:00:00Z")
+
+    def test_brain_http_client_updates_alpha_color(self):
+        session = FakeSession()
+        session.route("PATCH", "/alphas/abc123", FakeResponse(200, {"id": "abc123", "color": "GREEN"}))
+        client = BrainHTTPClient(session=session, sleep=lambda _seconds: None)
+
+        result = client.set_alpha_properties("abc123", color="GREEN")
+
+        self.assertEqual(result["color"], "GREEN")
+        method, path, kwargs = session.calls[0]
+        self.assertEqual((method, path), ("PATCH", "/alphas/abc123"))
+        self.assertEqual(kwargs["json"], {"color": "GREEN"})
 
     def test_brain_http_client_discovers_datafields_for_scope(self):
         session = FakeSession()
@@ -479,6 +626,12 @@ class LiveAdapterTests(unittest.TestCase):
 
         self.assertEqual(email, "user@example.com")
         self.assertEqual(password, "secret")
+
+    def test_brain_http_client_from_env_reads_poll_attempts(self):
+        with patch.dict(os.environ, {"BRAIN_POLL_ATTEMPTS": "17"}, clear=True):
+            client = BrainHTTPClient.from_env()
+
+        self.assertEqual(client.max_poll_attempts, 17)
 
     def test_brain_http_client_passes_request_timeout_to_session(self):
         class TimeoutSession:

@@ -124,6 +124,36 @@ class EfficiencyMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["totals"]["platform_error_failures"], 1)
         self.assertEqual(metrics["totals"]["quality_waste_failures"], 0)
 
+    def test_platform_settings_errors_do_not_count_as_quality_waste(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            candidate_id = _candidate(store, "rank(settings_error_signal)", "failed")
+            store.record_event(
+                candidate_id,
+                "simulation_error",
+                {"error": 'multisimulation creation failed: HTTP 400 [{"settings":{"cyclePlan":["Unexpected property."]}}]'},
+            )
+
+            metrics = compute_efficiency_metrics(store)
+
+        self.assertEqual(metrics["totals"]["platform_error_failures"], 1)
+        self.assertEqual(metrics["totals"]["quality_waste_failures"], 0)
+
+    def test_platform_poll_timeout_errors_do_not_count_as_quality_waste(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            candidate_id = _candidate(store, "rank(poll_timeout_signal)", "failed")
+            store.record_event(
+                candidate_id,
+                "simulation_error",
+                {"error": "simulation polling did not return an alpha id: location=/simulations/slow"},
+            )
+
+            metrics = compute_efficiency_metrics(store)
+
+        self.assertEqual(metrics["totals"]["platform_error_failures"], 1)
+        self.assertEqual(metrics["totals"]["quality_waste_failures"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

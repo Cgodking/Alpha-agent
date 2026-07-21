@@ -61,7 +61,8 @@ class AlphaStore:
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     @contextmanager
@@ -246,6 +247,44 @@ class AlphaStore:
                 ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def list_recent_archived_candidates(
+        self,
+        limit: int,
+        status: Optional[str] = None,
+        created_since: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit = max(0, int(limit))
+        if limit <= 0:
+            return []
+        where = []
+        params: List[Any] = []
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if created_since:
+            where.append("created_at >= ?")
+            params.append(created_since)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM archived_candidates
+                {clause}
+                ORDER BY original_candidate_id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        candidates: List[Dict[str, Any]] = []
+        for row in rows:
+            candidate = _row_to_dict(row)
+            candidate["id"] = int(candidate["original_candidate_id"])
+            candidate["archived"] = True
+            candidates.append(candidate)
+        return candidates
+
     def update_candidate(self, candidate_id: int, **fields: Any) -> None:
         if not fields:
             return
@@ -260,8 +299,63 @@ class AlphaStore:
             conn.execute(f"UPDATE candidates SET {assignments} WHERE id = ?", values)
 
     def transition(self, candidate_id: int, status: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        self.update_candidate(candidate_id, status=status)
-        self.record_event(candidate_id, f"status:{status}", metadata or {})
+        # Atomic: status update and the status event are written in one transaction so a
+        # crash can never leave a changed status without its event (or vice versa).
+        now = utc_now()
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, candidate_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO events (candidate_id, event_type, metadata_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (candidate_id, f"status:{status}", _json(metadata or {}), now),
+            )
+
+    def fail_preflight_passed_candidates(
+        self,
+        *,
+        created_since: Optional[str] = None,
+        reason: str = "interrupted_after_preflight",
+    ) -> int:
+        where = ["status = 'preflight_passed'"]
+        params: List[Any] = []
+        if created_since:
+            where.append("created_at >= ?")
+            params.append(created_since)
+        clause = " AND ".join(where)
+        now = utc_now()
+        metadata = {"reason": reason, "errors": ["INTERRUPTED_AFTER_PREFLIGHT"]}
+        with self.connection() as conn:
+            rows = conn.execute(f"SELECT id FROM candidates WHERE {clause} ORDER BY id", params).fetchall()
+            for row in rows:
+                candidate_id = int(row["id"])
+                conn.execute(
+                    "UPDATE candidates SET status = 'failed', updated_at = ? WHERE id = ?",
+                    (now, candidate_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO events (candidate_id, event_type, metadata_json, created_at)
+                    VALUES (?, 'status:failed', ?, ?)
+                    """,
+                    (candidate_id, _json(metadata), now),
+                )
+        return len(rows)
+
+    def count_preflight_passed_candidates(self, *, created_since: Optional[str] = None) -> int:
+        where = ["status = 'preflight_passed'"]
+        params: List[Any] = []
+        if created_since:
+            where.append("created_at >= ?")
+            params.append(created_since)
+        clause = " AND ".join(where)
+        with self.connection() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS count FROM candidates WHERE {clause}", params).fetchone()
+        return int(row["count"] or 0)
 
     def increment_retry(self, candidate_id: int) -> int:
         candidate = self.get_candidate(candidate_id)
@@ -288,6 +382,16 @@ class AlphaStore:
                     "SELECT * FROM events WHERE candidate_id = ? ORDER BY id",
                     (candidate_id,),
                 ).fetchall()
+                if not rows:
+                    rows = conn.execute(
+                        """
+                        SELECT *
+                        FROM archived_events
+                        WHERE candidate_id = ?
+                        ORDER BY original_event_id
+                        """,
+                        (candidate_id,),
+                    ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
     def archive_candidates(

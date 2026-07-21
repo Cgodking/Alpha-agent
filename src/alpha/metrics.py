@@ -10,7 +10,16 @@ from .models import DEFAULT_SETTINGS
 
 SIMULATED_STATUSES = {"simulated", "metric_passed", "approved", "submitted", "check_pending"}
 APPROVED_STATUSES = {"approved", "submitted"}
-PLATFORM_ERROR_MARKERS = ("429", "retry-after", "rate limit", "too many requests", "temporarily unavailable")
+PLATFORM_ERROR_MARKERS = (
+    "429",
+    "retry-after",
+    "rate limit",
+    "too many requests",
+    "temporarily unavailable",
+    "simulation polling did not return an alpha id",
+    "unexpected property",
+    "cycleplan",
+)
 
 
 def compute_efficiency_metrics(
@@ -188,7 +197,12 @@ def _field_family(expression: str) -> str:
 def _near_threshold(metrics: Dict[str, Any]) -> bool:
     sharpe = _float(metrics.get("sharpe"))
     fitness = _float(metrics.get("fitness"))
-    return sharpe >= 1.2 or fitness >= 0.65
+    turnover = _float(metrics.get("turnover"))
+    if sharpe >= 1.45:
+        return True
+    if sharpe < 1.2:
+        return False
+    return fitness >= 0.75 or 0.01 <= turnover <= 0.9
 
 
 def _has_event(events: Iterable[Dict[str, Any]], event_type: str) -> bool:

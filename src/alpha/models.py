@@ -43,6 +43,19 @@ class SimulationFailure:
 
 
 @dataclass(frozen=True)
+class SimulationPending:
+    location: str
+    error: str = "simulation_pending"
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+class SimulationPendingError(RuntimeError):
+    def __init__(self, location: str, message: str | None = None):
+        self.location = str(location)
+        super().__init__(message or f"simulation polling did not return an alpha id: location={self.location}")
+
+
+@dataclass(frozen=True)
 class SubmitResult:
     alpha_id: str
     submitted: bool

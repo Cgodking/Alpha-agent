@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ALPHA_ROOT:-/root/Alpha}"
 SESSION_NAME="${ALPHA_WEB_SESSION:-alpha_web}"
 SERVICE_NAME="${ALPHA_WEB_SERVICE:-alpha-web.service}"
-HOST="${ALPHA_WEB_HOST:-0.0.0.0}"
+HOST="${ALPHA_WEB_HOST:-127.0.0.1}"
 PORT="${ALPHA_WEB_PORT:-5000}"
 LOG_FILE="${ALPHA_WEB_LOG:-$ROOT_DIR/logs/web.stdout.log}"
 

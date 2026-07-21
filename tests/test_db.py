@@ -58,11 +58,13 @@ class AlphaStoreTests(unittest.TestCase):
             try:
                 journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
                 busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
             finally:
                 conn.close()
 
             self.assertEqual(str(journal_mode).lower(), "wal")
-            self.assertEqual(int(busy_timeout), 5000)
+            self.assertEqual(int(busy_timeout), 30000)
+            self.assertEqual(int(foreign_keys), 1)
 
     def test_store_initializes_query_indexes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -46,6 +46,18 @@ class HealthTests(unittest.TestCase):
 
             self.assertEqual(health["last_block_reason"], "ai_quota_blocked")
 
+    def test_daemon_health_ignores_stale_block_reason_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            store.record_event(None, "daemon_stopped", {"reason": "interrupted"})
+            store.set_run_state("daemon", {"status": "running", "pid": 123, "started_at": _iso(1), "stop_reason": ""})
+
+            health = daemon_health(store)
+
+            self.assertEqual(health["status"], "running")
+            self.assertEqual(health["last_block_reason"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

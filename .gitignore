@@ -4,9 +4,13 @@
 config/ai_model_profiles.json
 secrets/**/*.env
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 logs/
 data/
+artifacts/
+design-demos/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -17,3 +21,6 @@ htmlcov/
 .learnings/
 .superpower-with-files/
 Alpha/
+findings.md
+progress.md
+task_plan.md

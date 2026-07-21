@@ -10,7 +10,6 @@ ALLOWED_OPERATORS = {
     "and",
     "bucket",
     "densify",
-    "delta",
     "divide",
     "equal",
     "greater",
@@ -132,6 +131,18 @@ RESERVED_IDENTIFIERS = {
 EXACT_OPERATOR_ARITY = {
     "group_mean": 3,
     "hump": 1,
+    "last_diff_value": 2,
+}
+
+EVENT_INPUT_RESTRICTED_OPERATORS = {
+    "rank",
+    "ts_backfill",
+    "ts_delta",
+    "ts_mean",
+    "ts_rank",
+    "ts_std_dev",
+    "ts_sum",
+    "ts_zscore",
 }
 
 
@@ -143,6 +154,7 @@ def validate_expression(
     field_types: Dict[str, str] | None = None,
     enforce_auxiliary_field_roles: bool = False,
     auxiliary_fields: Iterable[str] | None = None,
+    event_fields: Iterable[str] | None = None,
 ) -> List[str]:
     errors: List[str] = []
     text = str(expression or "").strip()
@@ -161,16 +173,23 @@ def validate_expression(
     for op in operators:
         if op not in ALLOWED_OPERATORS:
             errors.append(f"UNKNOWN_OPERATOR:{op}")
-    if allowed_fields:
+    # allowed_fields is None means "no allowlist supplied, skip field validation".
+    # An explicitly supplied iterable (even empty) is validated against: an empty
+    # allowlist rejects every field rather than silently passing (fail-closed).
+    if allowed_fields is not None:
         allowed = _field_allowlist(allowed_fields)
         for field in _field_identifiers(text, operators):
             if field not in allowed and field.lower() not in allowed:
                 errors.append(f"UNKNOWN_FIELD:{field}")
     if enforce_auxiliary_field_roles:
         errors.extend(_auxiliary_primary_field_errors(text, auxiliary_fields))
+    errors.extend(_event_input_errors(text, event_fields))
     errors.extend(_operator_arity_errors(text))
     errors.extend(_vector_reducer_arity_errors(text))
+    errors.extend(_group_output_as_value_errors(text))
+    errors.extend(_low_value_motif_errors(text))
     if field_types:
+        errors.extend(_vector_value_operator_errors(text, field_types))
         errors.extend(_vector_reducer_type_errors(text, field_types))
         errors.extend(_vector_time_series_errors(text, field_types))
     return errors
@@ -190,6 +209,17 @@ def _balanced_parentheses(text: str) -> bool:
 
 def _has_empty_function_argument(text: str) -> bool:
     return bool(re.search(r"\(\s*,|,\s*,|,\s*\)", text))
+
+
+def _low_value_motif_errors(text: str) -> List[str]:
+    compact = re.sub(r"\s+", "", text).lower()
+    if (
+        "multiply(normalize(" in compact
+        and "inverse(add(1,abs(" in compact
+        and ("subtract(" in compact or "ts_delta(" in compact or "group_mean(" in compact)
+    ):
+        return ["LOW_VALUE_DAMPING_MOTIF:normalize_inverse_abs"]
+    return []
 
 
 def _field_allowlist(allowed_fields: Iterable[str]) -> Set[str]:
@@ -395,6 +425,29 @@ def _sorted_unique_fields(fields: List[str]) -> List[str]:
     return sorted(values)
 
 
+def _event_input_errors(text: str, event_fields: Iterable[str] | None) -> List[str]:
+    event_field_set = {
+        str(field).strip().lower()
+        for field in event_fields or []
+        if str(field).strip()
+    }
+    if not event_field_set:
+        return []
+
+    errors: List[str] = []
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        operator = match.group(1)
+        if operator not in EVENT_INPUT_RESTRICTED_OPERATORS:
+            continue
+        args = _function_arguments(text, match.end() - 1)
+        if not args:
+            continue
+        for field in _all_field_identifiers(args[0]):
+            if field.lower() in event_field_set:
+                errors.append(f"INVALID_EVENT_INPUT_OPERATOR:{operator}:{field}")
+    return list(dict.fromkeys(errors))
+
+
 def _vector_time_series_errors(text: str, field_types: Dict[str, str]) -> List[str]:
     type_map = _normalized_field_types(field_types)
     vector_fields = {field for field, field_type in type_map.items() if field_type == "VECTOR"}
@@ -407,6 +460,90 @@ def _vector_time_series_errors(text: str, field_types: Dict[str, str]) -> List[s
         if first_arg in vector_fields or first_arg.lower() in vector_fields:
             errors.append(f"INVALID_VECTOR_TS_OPERATOR:{operator}:{first_arg}")
     return list(dict.fromkeys(errors))
+
+
+GROUP_OUTPUT_VALUE_RESTRICTED_OPERATORS = {
+    "abs",
+    "add",
+    "divide",
+    "group_rank",
+    "group_scale",
+    "group_zscore",
+    "hump",
+    "inverse",
+    "log",
+    "multiply",
+    "normalize",
+    "quantile",
+    "rank",
+    "reverse",
+    "scale",
+    "sign",
+    "signed_power",
+    "sqrt",
+    "subtract",
+    "ts_mean",
+    "ts_rank",
+    "winsorize",
+    "zscore",
+}
+
+VECTOR_VALUE_RESTRICTED_OPERATORS = GROUP_OUTPUT_VALUE_RESTRICTED_OPERATORS | {
+    "max",
+    "min",
+    "pasteurize",
+    "quantile",
+    "zscore",
+}
+
+
+def _vector_value_operator_errors(text: str, field_types: Dict[str, str]) -> List[str]:
+    type_map = _normalized_field_types(field_types)
+    vector_fields = {field for field, field_type in type_map.items() if field_type == "VECTOR"}
+    vector_fields.update({field.lower() for field in vector_fields})
+    if not vector_fields:
+        return []
+
+    errors: List[str] = []
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        operator = match.group(1)
+        if operator not in VECTOR_VALUE_RESTRICTED_OPERATORS:
+            continue
+        args = _function_arguments(text, match.end() - 1)
+        if not args:
+            continue
+        for field in _direct_field_arguments(args):
+            if field in vector_fields or field.lower() in vector_fields:
+                errors.append(f"INVALID_VECTOR_INPUT_OPERATOR:{operator}:{field}")
+    return list(dict.fromkeys(errors))
+
+
+def _direct_field_arguments(args: List[str]) -> List[str]:
+    fields: List[str] = []
+    for arg in args:
+        text = arg.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+            fields.append(text)
+    return fields
+
+
+def _group_output_as_value_errors(text: str) -> List[str]:
+    errors: List[str] = []
+    for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        operator = match.group(1)
+        if operator not in GROUP_OUTPUT_VALUE_RESTRICTED_OPERATORS:
+            continue
+        args = _function_arguments(text, match.end() - 1)
+        if not args:
+            continue
+        if _expression_returns_group(args[0]):
+            errors.append(f"INVALID_GROUP_OUTPUT_AS_VALUE:{operator}:bucket")
+    return list(dict.fromkeys(errors))
+
+
+def _expression_returns_group(text: str) -> bool:
+    root = _root_function(text)
+    return bool(root and root[0] == "bucket")
 
 
 def _vector_reducer_type_errors(text: str, field_types: Dict[str, str]) -> List[str]:

@@ -9,13 +9,13 @@ def daemon_health(store: Any, *, stall_minutes: int = 60) -> Dict[str, Any]:
     state = store.get_run_state("daemon")
     status = str(state.get("status") or "stopped")
     started_at = str(state.get("started_at") or "")
-    last_block_reason = str(state.get("stop_reason") or "")
+    last_block_reason = "" if status == "running" else str(state.get("stop_reason") or "")
     last_event_at = ""
     for event in reversed(store.events_for_candidate(None)):
         event_type = str(event.get("event_type") or "")
         if not last_event_at:
             last_event_at = str(event.get("created_at") or "")
-        if event_type in {"daemon_stopped", "ai_generation_error", "quality_stop_loss"} and not last_block_reason:
+        if status != "running" and event_type in {"daemon_stopped", "ai_generation_error", "quality_stop_loss"} and not last_block_reason:
             metadata = _loads_dict(event.get("metadata_json"))
             last_block_reason = str(metadata.get("reason") or metadata.get("quality_stop_reason") or "")
     stalled = status == "running" and _minutes_since(last_event_at or started_at) >= float(stall_minutes)

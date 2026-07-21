@@ -17,10 +17,22 @@ class PreflightTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
-    def test_validate_expression_accepts_wqb_delta_operator(self):
+    def test_validate_expression_rejects_platform_inaccessible_delta_operator(self):
         errors = validate_expression("(-1) * ts_rank(delta(close, 1), 5)")
 
+        self.assertIn("UNKNOWN_OPERATOR:delta", errors)
+
+    def test_validate_expression_skips_field_check_when_allowlist_is_none(self):
+        # None means "no allowlist supplied": field validation is skipped.
+        errors = validate_expression("rank(ts_mean(made_up_field, 22))", allowed_fields=None)
+
         self.assertEqual(errors, [])
+
+    def test_validate_expression_rejects_all_fields_when_allowlist_is_empty(self):
+        # An explicitly empty allowlist is fail-closed: every field is unknown.
+        errors = validate_expression("rank(ts_mean(made_up_field, 22))", allowed_fields=[])
+
+        self.assertIn("UNKNOWN_FIELD:made_up_field", errors)
 
     def test_validate_expression_accepts_platform_ts_zscore_operator(self):
         errors = validate_expression("rank(ts_zscore(close, 20))")
@@ -143,6 +155,64 @@ class PreflightTests(unittest.TestCase):
         errors = validate_expression("group_rank(hump(ts_mean(close,55),0.01),industry)")
 
         self.assertIn("INVALID_OPERATOR_ARITY:hump:2!=1", errors)
+
+    def test_validate_expression_rejects_last_diff_value_without_lookback(self):
+        errors = validate_expression(
+            "rank(normalize(last_diff_value(actual_update_flag_ndt)))",
+            allowed_fields=["actual_update_flag_ndt"],
+        )
+
+        self.assertIn("INVALID_OPERATOR_ARITY:last_diff_value:1!=2", errors)
+
+    def test_validate_expression_rejects_rank_on_event_field(self):
+        errors = validate_expression(
+            "group_rank(normalize(add(rank(news_mention_frequency),rank(news_item_count_generic))),industry)",
+            allowed_fields=["news_mention_frequency", "news_item_count_generic"],
+            event_fields=["news_mention_frequency", "news_item_count_generic"],
+        )
+
+        self.assertIn("INVALID_EVENT_INPUT_OPERATOR:rank:news_mention_frequency", errors)
+        self.assertIn("INVALID_EVENT_INPUT_OPERATOR:rank:news_item_count_generic", errors)
+
+    def test_validate_expression_rejects_raw_vector_field_in_normalize(self):
+        errors = validate_expression(
+            "rank(subtract(normalize(anl83_cfoattendence),normalize(anl10_ndtpast_det_analyst_1939)))",
+            allowed_fields=["anl83_cfoattendence", "anl10_ndtpast_det_analyst_1939"],
+            field_types={
+                "anl83_cfoattendence": "VECTOR",
+                "anl10_ndtpast_det_analyst_1939": "VECTOR",
+            },
+        )
+
+        self.assertIn("INVALID_VECTOR_INPUT_OPERATOR:normalize:anl83_cfoattendence", errors)
+        self.assertIn("INVALID_VECTOR_INPUT_OPERATOR:normalize:anl10_ndtpast_det_analyst_1939", errors)
+
+    def test_validate_expression_rejects_bucket_group_output_as_numeric_signal(self):
+        errors = validate_expression(
+            'rank(bucket(vec_avg(snt7_universe_all_languagesisin_71),buckets="-0.5,0,0.5"))',
+            allowed_fields=["snt7_universe_all_languagesisin_71"],
+            field_types={"snt7_universe_all_languagesisin_71": "VECTOR"},
+        )
+
+        self.assertIn("INVALID_GROUP_OUTPUT_AS_VALUE:rank:bucket", errors)
+
+    def test_validate_expression_rejects_bucket_group_output_before_hump(self):
+        errors = validate_expression(
+            'rank(hump(bucket(vec_avg(snt7_universe_all_languagesisin_71),buckets="-1,0,1")))',
+            allowed_fields=["snt7_universe_all_languagesisin_71"],
+            field_types={"snt7_universe_all_languagesisin_71": "VECTOR"},
+        )
+
+        self.assertIn("INVALID_GROUP_OUTPUT_AS_VALUE:hump:bucket", errors)
+
+    def test_validate_expression_rejects_repeated_normalize_inverse_abs_damping_motif(self):
+        errors = validate_expression(
+            "rank(multiply(normalize(vec_avg(standardized_opinion_score)),inverse(add(1,abs(subtract(vec_avg(standardized_opinion_score),ts_mean(vec_avg(standardized_opinion_score),20)))))))",
+            allowed_fields=["standardized_opinion_score"],
+            field_types={"standardized_opinion_score": "VECTOR"},
+        )
+
+        self.assertIn("LOW_VALUE_DAMPING_MOTIF:normalize_inverse_abs", errors)
 
     def test_worker_fails_candidate_before_simulation_when_preflight_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

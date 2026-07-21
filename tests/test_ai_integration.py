@@ -63,6 +63,7 @@ class AiIntegrationTests(unittest.TestCase):
         self.assertIn("ts_backfill", prompt)
         system_prompt = seen["payload"]["messages"][0]["content"]
         self.assertIn("research_context.syntax_constraints", system_prompt)
+        self.assertIn("before scalar/value operators such as add, subtract, multiply, divide, normalize, zscore, and group_mean", system_prompt)
         self.assertIn("vec_avg(x) only", system_prompt)
         self.assertIn("Use divide(x, y), never div(x, y)", system_prompt)
         self.assertIn("group_rank(x, group)", system_prompt)
@@ -150,6 +151,117 @@ class AiIntegrationTests(unittest.TestCase):
         self.assertIn("family_diversity_control", system_prompt)
         self.assertIn("dominant family", system_prompt)
         self.assertIn("alternate_families", system_prompt)
+
+    def test_openai_client_prompt_includes_primary_field_scout_view(self):
+        seen = {}
+
+        def transport(payload):
+            seen["payload"] = payload
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"candidates":[{"expression":"rank(primary_signal)"}]}'
+                        }
+                    }
+                ]
+            }
+
+        client = OpenAICompatibleAIClient(api_key="test", model="model-x", transport=transport)
+        client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "universe": "TOP3000",
+                "delay": 0,
+                "research_context": {
+                    "field_scout": {
+                        "active": True,
+                        "top_fields": [
+                            {
+                                "field": "primary_signal",
+                                "score": 0.7,
+                                "primary_policy": "prefer_primary",
+                                "dataset_reason": "",
+                            },
+                            {
+                                "field": "avoid_signal",
+                                "score": 0.9,
+                                "primary_policy": "avoid_primary",
+                                "dataset_reason": "recent_dataset_failure_cluster",
+                            },
+                        ],
+                        "top_primary_fields": [
+                            {
+                                "field": "primary_signal",
+                                "score": 0.7,
+                                "primary_policy": "prefer_primary",
+                                "usage_constraints": ["requires_turnover_stabilizer"],
+                            }
+                        ],
+                    }
+                },
+            },
+        )
+
+        user_payload = json.loads(seen["payload"]["messages"][1]["content"])
+        scout = user_payload["research_context"]["field_scout"]
+        self.assertEqual(scout["top_primary_fields"][0]["field"], "primary_signal")
+        self.assertEqual(scout["top_primary_fields"][0]["usage_constraints"], ["requires_turnover_stabilizer"])
+        self.assertEqual(scout["top_fields"][1]["dataset_reason"], "recent_dataset_failure_cluster")
+        self.assertTrue(user_payload["constraints"]["respect_field_scout_usage_constraints"])
+
+    def test_openai_client_prompt_requires_quality_budget_and_probe_recommendations(self):
+        seen = {}
+
+        def transport(payload):
+            seen["payload"] = payload
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"candidates":[{"expression":"rank(ts_mean(primary_signal,20))"}]}'
+                        }
+                    }
+                ]
+            }
+
+        client = OpenAICompatibleAIClient(api_key="test", model="model-x", transport=transport)
+        client.generate_candidates(
+            1,
+            {
+                "region": "USA",
+                "universe": "TOP500",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "explore_new_family",
+                        "quality_budget": {
+                            "priority": "production_first",
+                            "slots": {"exploit_positive_evidence": 5, "probe_new_fields": 2, "broad_explore": 1},
+                        },
+                        "probe_recommendations": [
+                            {
+                                "field": "primary_signal",
+                                "templates": ["rank(ts_mean(primary_signal,20))"],
+                                "stabilization_required": True,
+                            }
+                        ],
+                    }
+                },
+            },
+        )
+
+        system_prompt = seen["payload"]["messages"][0]["content"]
+        user_payload = json.loads(seen["payload"]["messages"][1]["content"])
+        self.assertIn("quality_budget", system_prompt)
+        self.assertIn("probe_recommendations", system_prompt)
+        self.assertTrue(user_payload["constraints"]["respect_quality_budget"])
+        self.assertTrue(user_payload["constraints"]["use_probe_recommendations_for_probe_slots"])
+        self.assertEqual(
+            user_payload["research_context"]["experiment_plan"]["quality_budget"]["slots"]["probe_new_fields"],
+            2,
+        )
 
     def test_openai_client_prompt_mentions_submitted_field_avoidance(self):
         seen = {}
@@ -378,7 +490,10 @@ class AiIntegrationTests(unittest.TestCase):
         self.assertEqual(candidates[0].metadata["risk_notes"], "watch self correlation")
 
     def test_openai_client_does_not_allow_ai_to_override_run_settings(self):
-        def transport(_payload):
+        seen = {}
+
+        def transport(payload):
+            seen["payload"] = payload
             return {
                 "choices": [
                     {
@@ -406,13 +521,22 @@ class AiIntegrationTests(unittest.TestCase):
         client = OpenAICompatibleAIClient(api_key="test", model="model-x", transport=transport)
         candidates = client.generate_candidates(
             1,
-            {"region": "USA", "universe": "TOP3000", "delay": 1, "neutralization": "INDUSTRY"},
+            {
+                "region": "USA",
+                "universe": "TOP3000",
+                "delay": 1,
+                "neutralization": "INDUSTRY",
+                "cycle_plan": {"mode": "explore", "budget": {"batch_size": 8}},
+            },
         )
 
         self.assertEqual(candidates[0].settings["region"], "USA")
         self.assertEqual(candidates[0].settings["universe"], "TOP3000")
         self.assertEqual(candidates[0].settings["delay"], 1)
         self.assertEqual(candidates[0].settings["neutralization"], "INDUSTRY")
+        self.assertNotIn("cycle_plan", candidates[0].settings)
+        user_payload = json.loads(seen["payload"]["messages"][1]["content"])
+        self.assertNotIn("cycle_plan", user_payload["target_settings"])
         self.assertEqual(candidates[0].metadata["proposed_settings"]["region"], "CHN")
 
     def test_openai_client_reports_invalid_json_as_ai_error(self):
@@ -628,7 +752,7 @@ class AiIntegrationTests(unittest.TestCase):
             events = store.events_for_candidate(None)
             self.assertTrue(any(event["event_type"] == "ai_generation_error" for event in events))
 
-    def test_worker_does_not_retry_non_retryable_ai_quota_error(self):
+    def test_worker_stops_before_fallback_after_ai_quota_error(self):
         class QuotaFailingAI:
             def __init__(self):
                 self.calls = 0
@@ -655,13 +779,70 @@ class AiIntegrationTests(unittest.TestCase):
             summary = worker.run_once()
 
             self.assertEqual(ai.calls, 1)
+            self.assertEqual(summary["generated"], 0)
             self.assertEqual(summary["failed"], 1)
             self.assertEqual(summary["ai_quota_blocked"], 1)
+            self.assertEqual(store.list_candidates(), [])
             events = store.events_for_candidate(None)
             generation_errors = [event for event in events if event["event_type"] == "ai_generation_error"]
             self.assertEqual(len(generation_errors), 1)
             metadata = json.loads(generation_errors[0]["metadata_json"])
             self.assertTrue(metadata["non_retryable"])
+            self.assertEqual(metadata["reason"], "ai_quota_blocked")
+            self.assertFalse(any(event["event_type"] == "deterministic_generation_fallback" for event in events))
+
+    def test_worker_quota_block_does_not_generate_safe_datafield_fallback(self):
+        class QuotaFailingAI:
+            def generate_candidates(self, batch_size, context):
+                raise AIClientError(
+                    'AI request failed: HTTP 403: {"error":{"code":"insufficient_user_quota"}}'
+                )
+
+        class MixedFieldBrain(LocalBrainClient):
+            def discover_datafields(self, settings, search_terms=None, max_fields=120):
+                return [
+                    {
+                        "id": "raw_insider_signal",
+                        "type": "MATRIX",
+                        "dataset": {"id": "insider_trx_matrix", "name": "Insider transactions"},
+                        "category": {"name": "Insiders"},
+                        "coverage": 0.9,
+                        "userCount": 0,
+                        "alphaCount": 0,
+                        "pyramidMultiplier": 1.8,
+                        "description": "Raw insider transaction value.",
+                    },
+                    {
+                        "id": "safe_quality_signal",
+                        "type": "MATRIX",
+                        "dataset": {"id": "quality12", "name": "Quality"},
+                        "category": {"name": "Fundamental"},
+                        "coverage": 0.8,
+                        "userCount": 0,
+                        "alphaCount": 0,
+                        "pyramidMultiplier": 1.4,
+                        "description": "Quality signal.",
+                    },
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ALPHA_FIELD_CACHE_DIR": str(Path(tmp) / "field_cache")}):
+                store = AlphaStore(Path(tmp) / "alpha.db")
+                store.init()
+                worker = AlphaWorker(
+                    store=store,
+                    ai_client=QuotaFailingAI(),
+                    brain_client=MixedFieldBrain(),
+                    policy=SubmissionPolicy(auto_submit=False, max_retries=1),
+                    batch_size=1,
+                )
+
+                summary = worker.run_once()
+
+            self.assertEqual(summary["generated"], 0)
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(summary["ai_quota_blocked"], 1)
+            self.assertEqual(store.list_candidates(), [])
 
     def test_worker_retries_ai_generation_before_success(self):
         class FlakyAI:

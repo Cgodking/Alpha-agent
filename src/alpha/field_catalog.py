@@ -10,8 +10,30 @@ from typing import Any, Dict, Iterable, List
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIELD_CACHE_DIR = PROJECT_ROOT / "data" / "field_cache"
-DEFAULT_FIELD_SEARCH_TERMS = ["", "model", "analyst", "fundamental", "pv", "news", "sentiment"]
-DEFAULT_FIELD_LIMIT = 600
+DEFAULT_FIELD_SEARCH_TERMS = [
+    "option",
+    "risk",
+    "shortinterest",
+    "short interest",
+    "earnings",
+    "fundamental",
+    "news",
+    "analyst",
+    "sentiment",
+    "social",
+    "insider",
+    "institution",
+    "macro",
+    "other",
+    "quality",
+    "debt",
+    "tax",
+    "cashflow",
+    "model",
+    "pv",
+    "",
+]
+DEFAULT_FIELD_LIMIT = 1200
 DEFAULT_FIELD_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 BUILTIN_FIELDS = [
@@ -188,7 +210,10 @@ def _field_search_terms() -> List[str]:
     if raw is None:
         return DEFAULT_FIELD_SEARCH_TERMS
     terms = [item.strip() for item in raw.split(",")]
-    return [term for term in terms if term] or [""]
+    cleaned = [term for term in terms if term]
+    if any(term == "" for term in terms) and "" not in cleaned:
+        cleaned.append("")
+    return cleaned or [""]
 
 
 def _cache_path(

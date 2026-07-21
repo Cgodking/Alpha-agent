@@ -148,6 +148,24 @@ PYTHONPATH=src python3 -m alpha.cli --db alpha.db daemon --region <region> --uni
 
 从前端启动或停止不会绕过字段验证、BRAIN 回测、重试上限、相关性检查或最终提交上限。
 
+## 控制台安全
+
+- 默认只绑回环地址 `127.0.0.1`,不对外暴露。
+- 手机/局域网访问:设置 `ALPHA_WEB_HOST=0.0.0.0`。
+  - 走 `scripts/alpha_web` 时读 `ALPHA_WEB_HOST`/`ALPHA_WEB_PORT`。
+  - 直接 `python3 -m alpha.cli web` 时也会读这两个环境变量作为 `--host`/`--port` 的回退;显式 `--host`/`--port` 优先级最高。
+- 可选鉴权:如果设置 `ALPHA_WEB_TOKEN`,手机上用带 `?token=<your_token>` 的链接打开控制台,前端会记住 token 并在后续请求自动带上 `X-Alpha-Token` 头。
+- 风险提示:绑非回环地址(如 `0.0.0.0`)却没设 `ALPHA_WEB_TOKEN` 时,只打印 warning,不阻止启动。
+- 状态变更接口(start/stop/clear-logs)额外做同源(Origin/Referer)校验,阻断 CSRF。
+- 请求体有 1 MiB 上限。
+
+启动示例(手机可访问):
+
+```bash
+ALPHA_WEB_HOST=0.0.0.0 PYTHONPATH=src python3 -m alpha.cli --db alpha.db web
+# 然后手机打开 http://SERVER_IP:8080/
+```
+
 ## 关键环境变量
 
 - `AUTO_SUBMIT`: 默认 `false`

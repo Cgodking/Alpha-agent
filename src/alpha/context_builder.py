@@ -12,8 +12,16 @@ from .db import AlphaStore
 from .expression_similarity import expression_structure_key, expression_variant_key
 from .field_scout import build_field_scout
 from .history_prune import DEFAULT_LOW_QUALITY_SCORE_MAX
-from .preflight import ALLOWED_OPERATORS
-from .research_planner import analyze_research_history, build_experiment_plan, candidate_quality_summary, _extract_fields
+from .preflight import ALLOWED_OPERATORS, EXACT_OPERATOR_ARITY
+from .research_planner import (
+    DEFAULT_REQUIRED_FITNESS,
+    DEFAULT_REQUIRED_SHARPE,
+    analyze_research_history,
+    build_experiment_plan,
+    candidate_optimization_summary,
+    candidate_quality_summary,
+    _extract_fields,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +70,7 @@ def build_ai_research_context(
     platform_pyramid_alphas: Dict[str, Any] | List[Dict[str, Any]] | None = None,
     platform_pyramid_multipliers: Dict[str, Any] | List[Dict[str, Any]] | None = None,
     history_limit: int = 8,
+    cycle_plan: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     target_settings = {key: value for key, value in dict(base_context or {}).items() if key != "research_context"}
     resolved_knowledge_dir = (
@@ -143,6 +152,7 @@ def build_ai_research_context(
             store,
             target_settings,
             _field_ids_from_catalog(field_catalog),
+            field_catalog=field_catalog,
             submitted_avoidance=context.get("submitted_field_avoidance"),
             lit_tower_avoidance=context.get("lit_tower_avoidance"),
             created_since=active_run_started_at,
@@ -151,12 +161,18 @@ def build_ai_research_context(
         store,
         target_settings,
         _field_ids_from_catalog(field_catalog),
+        field_catalog=field_catalog,
         submitted_avoidance=context.get("submitted_field_avoidance"),
         lit_tower_avoidance=context.get("lit_tower_avoidance"),
     )
+    field_scout_history_memory = (
+        context.get("active_run_history_memory")
+        if active_run_started_at and isinstance(context.get("active_run_history_memory"), dict)
+        else context.get("history_memory")
+    )
     context["field_scout"] = build_field_scout(
         context.get("datafields") if isinstance(context.get("datafields"), dict) else {},
-        history_memory=context.get("history_memory") if isinstance(context.get("history_memory"), dict) else {},
+        history_memory=field_scout_history_memory if isinstance(field_scout_history_memory, dict) else {},
         submitted_avoidance=context.get("submitted_field_avoidance")
         if isinstance(context.get("submitted_field_avoidance"), dict)
         else {},
@@ -165,15 +181,511 @@ def build_ai_research_context(
         else {},
     )
     analysis = analyze_research_history(context)
+    lit_fallback_applied = False
+    if _should_allow_lit_tower_field_scout_fallback(context, analysis):
+        context["field_scout"] = build_field_scout(
+            context.get("datafields") if isinstance(context.get("datafields"), dict) else {},
+            history_memory=field_scout_history_memory if isinstance(field_scout_history_memory, dict) else {},
+            submitted_avoidance=context.get("submitted_field_avoidance")
+            if isinstance(context.get("submitted_field_avoidance"), dict)
+            else {},
+            lit_tower_avoidance=context.get("lit_tower_avoidance")
+            if isinstance(context.get("lit_tower_avoidance"), dict)
+            else {},
+            allow_lit_tower_fallback=True,
+        )
+        analysis = analyze_research_history(context)
+        lit_fallback_applied = True
+    plan = _apply_cycle_plan_experiment_override(
+        store,
+        target_settings,
+        build_experiment_plan(analysis, target_settings),
+        cycle_plan,
+    )
+    if lit_fallback_applied and _lit_tower_fallback_without_active_rescue(context, plan):
+        context["field_scout"] = build_field_scout(
+            context.get("datafields") if isinstance(context.get("datafields"), dict) else {},
+            history_memory=field_scout_history_memory if isinstance(field_scout_history_memory, dict) else {},
+            submitted_avoidance=context.get("submitted_field_avoidance")
+            if isinstance(context.get("submitted_field_avoidance"), dict)
+            else {},
+            lit_tower_avoidance=context.get("lit_tower_avoidance")
+            if isinstance(context.get("lit_tower_avoidance"), dict)
+            else {},
+        )
+        analysis = analyze_research_history(context)
+        plan = _apply_cycle_plan_experiment_override(
+            store,
+            target_settings,
+            build_experiment_plan(analysis, target_settings),
+            cycle_plan,
+        )
     context["analysis"] = analysis
-    context["experiment_plan"] = build_experiment_plan(analysis, target_settings)
+    context["experiment_plan"] = plan
+    if isinstance(cycle_plan, dict) and cycle_plan:
+        context["cycle_plan"] = dict(cycle_plan)
     return context
+
+
+def _lit_tower_fallback_without_active_rescue(context: Dict[str, Any], plan: Dict[str, Any]) -> bool:
+    field_scout = context.get("field_scout") if isinstance(context.get("field_scout"), dict) else {}
+    top_primary = field_scout.get("top_primary_fields")
+    if not isinstance(top_primary, list):
+        return False
+    has_lit_fallback = any(isinstance(row, dict) and row.get("lit_tower_fallback") for row in top_primary)
+    if not has_lit_fallback:
+        return False
+    production_rescue = plan.get("production_rescue") if isinstance(plan, dict) else {}
+    return not (isinstance(production_rescue, dict) and production_rescue.get("active"))
+
+
+def _should_allow_lit_tower_field_scout_fallback(context: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
+    field_scout = context.get("field_scout") if isinstance(context.get("field_scout"), dict) else {}
+    if field_scout.get("status") != "no_primary_fields":
+        return False
+    lit_towers = context.get("lit_tower_avoidance") if isinstance(context.get("lit_tower_avoidance"), dict) else {}
+    if not lit_towers.get("lit_towers"):
+        return False
+    scope_health = analysis.get("scope_health") if isinstance(analysis.get("scope_health"), dict) else {}
+    signals = scope_health.get("trouble_signals") if isinstance(scope_health.get("trouble_signals"), dict) else {}
+    failure_streak = int(_numeric_value(signals.get("failure_streak")))
+    scanned_candidates = int(_numeric_value(signals.get("scanned_candidates")))
+    return failure_streak >= 96 and scanned_candidates >= 120
+
+
+def _numeric_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_cycle_plan_experiment_override(
+    store: AlphaStore,
+    target_settings: Dict[str, Any],
+    plan: Dict[str, Any],
+    cycle_plan: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(cycle_plan, dict):
+        return plan
+    plan = _apply_cycle_plan_field_exposure(plan, cycle_plan)
+    mode = str(cycle_plan.get("mode") or "")
+    if mode == "explore" and _cycle_plan_avoids_production_rescue(cycle_plan):
+        return _production_rescue_exhausted_explore_plan(plan, target_settings, cycle_plan)
+    if mode != "optimize":
+        return plan
+    try:
+        target_id = int(cycle_plan.get("target_candidate_id") or 0)
+    except (TypeError, ValueError):
+        return plan
+    if target_id <= 0:
+        return plan
+    try:
+        row = store.get_candidate(target_id)
+    except KeyError:
+        return plan
+
+    settings = _loads_json(row.get("settings_json"))
+    if not _candidate_scope_matches(settings, target_settings):
+        return plan
+    metrics = _loads_json(row.get("metrics_json"))
+    checks = _loads_json(row.get("checks_json"))
+    metrics = metrics if isinstance(metrics, dict) else {}
+    checks = checks if isinstance(checks, dict) else {}
+    expression = str(row.get("expression") or "").strip()
+    fields = _extract_fields(expression, [])
+    primary_fields = _primary_signal_fields(fields)
+    submitted_target_fields = _submitted_target_field_hits(primary_fields, plan)
+    if submitted_target_fields:
+        return _submitted_target_explore_plan(
+            plan,
+            target_settings,
+            cycle_plan,
+            target_id=target_id,
+            target_expression=expression,
+            target_fields=fields,
+            submitted_target_fields=submitted_target_fields,
+        )
+    candidate = {
+        "id": target_id,
+        "status": row.get("status"),
+        "alpha_id": row.get("alpha_id"),
+        "expression": expression,
+        "metrics": metrics,
+        "checks": checks,
+        "fields": fields,
+    }
+    quality = candidate_quality_summary(candidate)
+    targeted_repair = _targeted_repair_policy(candidate, plan)
+    correlation_blocked = bool(targeted_repair.get("correlation_blocked")) if targeted_repair else False
+    cooldown_primary_fields = list(targeted_repair.get("cooldown_primary_fields") or []) if targeted_repair else []
+    kept_fields = fields[:8]
+    avoid_fields = list(plan.get("avoid") or [])
+    if correlation_blocked and cooldown_primary_fields:
+        kept_fields = [field for field in kept_fields if field not in set(cooldown_primary_fields)]
+        avoid_fields = _dedupe_list(avoid_fields + cooldown_primary_fields)
+    budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+    try:
+        batch_size = max(1, int(budget.get("batch_size") or plan.get("batch_size") or 8))
+    except (TypeError, ValueError):
+        batch_size = 8
+
+    overridden = {
+        "mode": "optimize_best",
+        "target_candidate_id": target_id,
+        "optimization_anchor_id": target_id,
+        "optimize_round": 1,
+        "baseline_score": round(float(quality.get("quality_score") or 0.0), 6),
+        "baseline_sharpe": round(_number(metrics.get("sharpe")), 6),
+        "baseline_fitness": round(_number(metrics.get("fitness")), 6),
+        "current_score": round(float(quality.get("quality_score") or 0.0), 6),
+        "readiness_score": round(float(quality.get("readiness_score") or 0.0), 6),
+        "submission_score": round(float(quality.get("submission_score") or 0.0), 6),
+        "target_expression": expression,
+        "objective": (
+            "Scheduler selected this probe-ready candidate for targeted optimization. Generate controlled variants "
+            "around the target expression; do not fall back to production rescue probes in this cycle."
+        ),
+        "keep": kept_fields,
+        "change": [
+            "repair formula structure around the target",
+            "test sign and window variants",
+            "improve Sharpe and Fitness without switching field family",
+        ],
+        "avoid": avoid_fields,
+        "scheduler_plan": dict(cycle_plan),
+        "batch_size": batch_size,
+        "target_settings": dict(target_settings),
+        "quality_thresholds": plan.get("quality_thresholds") if isinstance(plan.get("quality_thresholds"), dict) else {},
+        "optimization_gap_summary": candidate_optimization_summary(candidate),
+        "quality_budget": {
+            "priority": "scheduler_optimize_target",
+            "batch_size": batch_size,
+            "slots": {"optimize_anchor": batch_size},
+            "exploit_fields": fields[: max(1, batch_size)],
+            "policy": "Spend this cycle on the scheduler-selected target; do not allocate fresh probe slots.",
+            "rationale": str(cycle_plan.get("reason") or "scheduler_optimize_target"),
+        },
+        "probe_recommendations": [],
+        "production_rescue": {"active": False, "reason": "scheduler_optimize_target"},
+    }
+    if targeted_repair:
+        overridden["targeted_repair"] = targeted_repair
+        overridden["objective"] = (
+            "Near-threshold repair: keep the target's proven Sharpe edge, lift Fitness over the required floor, "
+            "and clear correlation/diversity blockers. Do not spend this cycle on broad exploration."
+        )
+        overridden["change"] = [
+            "raise Fitness above the required floor while preserving Sharpe",
+            "reduce terminal correlation/diversity blockers with mechanism changes, not tiny window-only edits",
+            "if correlation is blocked, transfer the mechanism away from cooled primary fields",
+        ]
+        overridden["quality_budget"]["policy"] = (
+            "near-threshold repair only: spend this cycle on deep repair of the scheduler target; "
+            "do not allocate broad exploration slots."
+        )
+    for key in (
+        "family_diversity_control",
+        "submitted_field_avoidance",
+        "lit_tower_avoidance",
+        "field_scout",
+        "scope_trouble",
+        "mechanism_transfer",
+        "route_stop_loss",
+        "structure_diversity_control",
+        "field_exposure_control",
+    ):
+        if key in plan:
+            overridden[key] = plan[key]
+    return overridden
+
+
+def _apply_cycle_plan_field_exposure(plan: Dict[str, Any], cycle_plan: Dict[str, Any]) -> Dict[str, Any]:
+    constraints = cycle_plan.get("constraints") if isinstance(cycle_plan.get("constraints"), dict) else {}
+    cooldown_fields = [str(field) for field in constraints.get("cooldown_fields") or [] if str(field).strip()]
+    if not cooldown_fields:
+        return plan
+    updated = dict(plan)
+    updated["avoid"] = _dedupe_list(list(plan.get("avoid") or []) + cooldown_fields)
+    updated["scheduler_plan"] = dict(cycle_plan)
+    updated["field_exposure_control"] = {
+        "cooldown_fields": cooldown_fields,
+        "exposure": constraints.get("field_exposure")
+        if isinstance(constraints.get("field_exposure"), dict)
+        else {},
+        "policy": (
+            "Do not use cooldown_fields as primary alpha signals in this cycle. They may appear only as "
+            "necessary market or grouping helpers; choose fresh primary fields from other families."
+        ),
+    }
+    return updated
+
+
+def _submitted_target_field_hits(fields: List[str], plan: Dict[str, Any]) -> List[str]:
+    avoidance = plan.get("submitted_field_avoidance") if isinstance(plan.get("submitted_field_avoidance"), dict) else {}
+    submitted_fields = {str(field) for field in avoidance.get("fields") or [] if str(field).strip()}
+    submitted_families = {str(family) for family in avoidance.get("families") or [] if str(family).strip()}
+    hits: List[str] = []
+    for field in fields:
+        if field in submitted_fields or _submission_field_family(field) in submitted_families:
+            hits.append(field)
+    return _dedupe_list(hits)
+
+
+def _submitted_target_explore_plan(
+    plan: Dict[str, Any],
+    target_settings: Dict[str, Any],
+    cycle_plan: Dict[str, Any],
+    *,
+    target_id: int,
+    target_expression: str,
+    target_fields: List[str],
+    submitted_target_fields: List[str],
+) -> Dict[str, Any]:
+    budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+    try:
+        batch_size = max(1, int(budget.get("batch_size") or plan.get("batch_size") or 8))
+    except (TypeError, ValueError):
+        batch_size = 8
+    avoid_fields = _dedupe_list(list(plan.get("avoid") or []) + submitted_target_fields + target_fields)
+    overridden = dict(plan)
+    overridden.update(
+        {
+            "mode": "explore_new_family",
+            "target_candidate_id": None,
+            "optimization_anchor_id": None,
+            "abandoned_target_id": target_id,
+            "abandon_reason": "SUBMITTED_FIELD_AVOIDANCE",
+            "target_expression": "",
+            "scheduler_plan": dict(cycle_plan),
+            "batch_size": batch_size,
+            "target_settings": dict(target_settings),
+            "objective": (
+                "The scheduler-selected optimization target uses fields from recently approved/submitted alphas. "
+                "Do not optimize local variants of that target; transfer any useful mechanism only to fresh, "
+                "non-submitted primary fields."
+            ),
+            "keep": [],
+            "change": [
+                "abandon the submitted-field optimization target",
+                "transfer only the mechanism to fresh primary fields",
+                "avoid local variants of the submitted field family",
+            ],
+            "avoid": avoid_fields,
+            "quality_budget": {
+                "priority": "fresh_explore_after_submitted_field_target",
+                "batch_size": batch_size,
+                "slots": {"broad_explore": batch_size},
+                "exploit_fields": [],
+                "policy": "Do not allocate optimize slots to targets using submitted-field avoidance hits.",
+                "rationale": str(cycle_plan.get("reason") or "submitted_field_target"),
+            },
+            "probe_recommendations": [],
+            "production_rescue": {"active": False, "reason": "submitted_field_target"},
+            "mechanism_transfer": _submitted_target_mechanism_transfer(plan, target_id, target_expression, target_fields),
+        }
+    )
+    return overridden
+
+
+def _submitted_target_mechanism_transfer(
+    plan: Dict[str, Any],
+    target_id: int,
+    target_expression: str,
+    target_fields: List[str],
+) -> Dict[str, Any]:
+    existing = plan.get("mechanism_transfer") if isinstance(plan.get("mechanism_transfer"), dict) else {}
+    forbidden_fields = _dedupe_list(list(existing.get("forbidden_fields") or []) + target_fields)
+    archetype = {
+        "id": target_id,
+        "status": "abandoned",
+        "fields": target_fields[:10],
+        "families": _dedupe_list([_submission_field_family(field) for field in target_fields if _submission_field_family(field)])[:8],
+        "blocked_by": ["submitted_field_avoidance"],
+        "forbidden_fields": forbidden_fields[:12],
+        "mechanism_tags": _mechanism_tags(target_expression, target_fields),
+        "transfer_hint": _mechanism_transfer_hint(target_expression, target_fields),
+    }
+    archetypes = list(existing.get("archetypes") or [])
+    return {
+        **existing,
+        "active": True,
+        "policy": (
+            "Use these as mechanism only examples. Do not copy expressions, do not use forbidden_fields as "
+            "primary fields, and transfer mechanisms to fresh non-submitted fields."
+        ),
+        "forbidden_fields": forbidden_fields[:30],
+        "archetypes": [archetype, *archetypes][:8],
+    }
+
+
+def _targeted_repair_policy(candidate: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+    checks = candidate.get("checks") if isinstance(candidate.get("checks"), dict) else {}
+    thresholds = plan.get("quality_thresholds") if isinstance(plan.get("quality_thresholds"), dict) else {}
+    required_sharpe = _number(thresholds.get("required_sharpe")) or DEFAULT_REQUIRED_SHARPE
+    required_fitness = _number(thresholds.get("required_fitness")) or DEFAULT_REQUIRED_FITNESS
+    sharpe = _number(metrics.get("sharpe"))
+    fitness = _number(metrics.get("fitness"))
+    fitness_gap = max(0.0, required_fitness - fitness)
+    triggers: List[str] = []
+    if sharpe >= required_sharpe and 0.0 < fitness_gap <= max(0.15, required_fitness * 0.12):
+        triggers.append("fitness_gap")
+    correlation_blockers = _correlation_blockers(checks)
+    diversity_blockers = _diversity_blockers(checks)
+    if correlation_blockers and sharpe >= required_sharpe * 0.95:
+        triggers.append("prod_correlation")
+    if diversity_blockers and sharpe >= required_sharpe * 0.95:
+        triggers.append("data_diversity")
+    if not triggers:
+        return {}
+
+    fields = [str(field) for field in candidate.get("fields") or [] if str(field).strip()]
+    cooldown_primary_fields = _primary_signal_fields(fields)
+    return {
+        "active": True,
+        "strategy": "near_threshold_deep_repair",
+        "orchestration": "deep_repair",
+        "triggers": triggers,
+        "target_metric": "fitness",
+        "required_sharpe": round(required_sharpe, 6),
+        "required_fitness": round(required_fitness, 6),
+        "current_sharpe": round(sharpe, 6),
+        "current_fitness": round(fitness, 6),
+        "fitness_gap": round(fitness_gap, 6),
+        "blocked_checks": correlation_blockers + diversity_blockers,
+        "correlation_blocked": bool(correlation_blockers),
+        "cooldown_primary_fields": cooldown_primary_fields if correlation_blockers else [],
+        "forbid_same_field_only_variants": bool(correlation_blockers),
+        "policy": (
+            "Use controller/validator repair only for this near-threshold target. If correlation is blocked, "
+            "do not spend the batch on same-primary-field window or sign tweaks; migrate the mechanism to fresh "
+            "allowed fields while preserving the high-Sharpe geometry."
+        ),
+    }
+
+
+def _correlation_blockers(checks: Dict[str, Any]) -> List[str]:
+    blockers: List[str] = []
+    for name in ("PROD_CORRELATION", "PRODUCT_CORRELATION", "SELF_CORRELATION"):
+        check = checks.get(name)
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status") or check.get("result") or "").upper()
+        value = _number(check.get("value"))
+        limit = _number(check.get("limit"))
+        if status in {"FAIL", "FAILED", "WARNING"} or (limit > 0 and value > limit):
+            blockers.append(name)
+    return blockers
+
+
+def _diversity_blockers(checks: Dict[str, Any]) -> List[str]:
+    check = checks.get("DATA_DIVERSITY")
+    if not isinstance(check, dict):
+        return []
+    status = str(check.get("status") or check.get("result") or "").upper()
+    return ["DATA_DIVERSITY"] if status in {"FAIL", "FAILED", "WARNING"} else []
+
+
+def _primary_signal_fields(fields: List[str]) -> List[str]:
+    ignored = set(SUBMISSION_FIELD_AUXILIARIES) | {
+        "market",
+        "sector",
+        "industry",
+        "subindustry",
+        "country",
+        "exchange",
+    }
+    return [field for field in fields if field not in ignored and not field.startswith("pv13_")]
+
+
+def _dedupe_list(items: List[Any]) -> List[Any]:
+    seen: set[str] = set()
+    result: List[Any] = []
+    for item in items:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _cycle_plan_avoids_production_rescue(cycle_plan: Dict[str, Any]) -> bool:
+    reason = str(cycle_plan.get("reason") or "")
+    constraints = cycle_plan.get("constraints") if isinstance(cycle_plan.get("constraints"), dict) else {}
+    avoid_modes = constraints.get("avoid_modes") if isinstance(constraints, dict) else []
+    if not isinstance(avoid_modes, list):
+        avoid_modes = []
+    return reason == "production_rescue_duplicate_only_recent" or "production_rescue" in {
+        str(mode) for mode in avoid_modes if str(mode).strip()
+    }
+
+
+def _production_rescue_exhausted_explore_plan(
+    plan: Dict[str, Any],
+    target_settings: Dict[str, Any],
+    cycle_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+    try:
+        batch_size = max(1, int(budget.get("batch_size") or plan.get("batch_size") or 8))
+    except (TypeError, ValueError):
+        batch_size = 8
+    overridden = dict(plan)
+    overridden.update(
+        {
+            "mode": "explore_new_family",
+            "target_candidate_id": None,
+            "target_expression": "",
+            "scheduler_plan": dict(cycle_plan),
+            "batch_size": batch_size,
+            "target_settings": dict(target_settings),
+            "objective": (
+                "The previous production rescue path exhausted its actionable probe by repeating an existing "
+                "candidate. Generate fresh AI candidates from different field families and formula structures."
+            ),
+            "keep": [],
+            "change": [
+                "switch away from the exhausted production rescue probe",
+                "generate fresh field families",
+                "use structurally different formulas",
+            ],
+            "quality_budget": {
+                "priority": "fresh_explore_after_rescue_exhausted",
+                "batch_size": batch_size,
+                "slots": {"broad_explore": batch_size},
+                "exploit_fields": [],
+                "policy": "Do not allocate production rescue probe slots in this cycle; the last rescue probe was a duplicate.",
+                "rationale": str(cycle_plan.get("reason") or "production_rescue_exhausted"),
+            },
+            "probe_recommendations": [],
+            "production_rescue": {
+                "active": False,
+                "reason": str(cycle_plan.get("reason") or "production_rescue_exhausted"),
+            },
+        }
+    )
+    return overridden
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _syntax_constraints(store: AlphaStore, history_limit: int) -> Dict[str, Any]:
     return {
         "allowed_operators": sorted(ALLOWED_OPERATORS),
         "operator_rule": "Use only operators in allowed_operators. Do not invent operator names.",
+        "exact_operator_arity": dict(sorted(EXACT_OPERATOR_ARITY.items())),
+        "operator_arity_rule": (
+            "Operators in exact_operator_arity must use exactly that many arguments. "
+            "Examples: group_mean(x, weight, group) has 3 arguments; do not write group_mean(x, group). "
+            "hump(x) has 1 argument; last_diff_value(x, lookback) has 2 arguments."
+        ),
         "field_rule": "Copy field identifiers exactly from datafields.field_ids. Do not rename, prefix, suffix, or guess fields.",
         "auxiliary_only_fields": sorted(SUBMISSION_FIELD_AUXILIARIES),
         "auxiliary_field_rule": (
@@ -184,6 +696,16 @@ def _syntax_constraints(store: AlphaStore, history_limit: int) -> Dict[str, Any]
         "vector_reducer_rule": (
             "vec_avg(x) only, and all vec_* reducers take exactly one VECTOR field argument and no time window. "
             "Apply time-series windows outside the reducer, for example ts_mean(vec_avg(vector_field), 30)."
+        ),
+        "event_input_rule": (
+            "News/event fields often cannot be passed directly into rank or ts_* operators. Prefer scale, normalize, "
+            "divide, or combine them with stable non-event fields unless a field is clearly MATRIX time-series safe."
+        ),
+        "turnover_stabilization_rule": (
+            "For high-turnover alternative fields from SENTIMENT, NEWS, SOCIALMEDIA, SHORTINTEREST, "
+            "EARNINGS, or INSIDERS datasets, do not use raw field values directly as primary alpha signals. "
+            "First stabilize them with ts_mean, ts_rank, ts_decay_linear, ts_zscore, ts_backfill, or another "
+            "time-series stabilizer before rank/normalize/if_else/cross-sectional transforms."
         ),
         "structure_dedup_rule": (
             "Do not return local variants that reuse the same operator skeleton and same field ids with only "
@@ -870,6 +1392,16 @@ def _simulation_errors(store: AlphaStore, candidate_id: int) -> List[Dict[str, A
     return errors[-3:]
 
 
+def _candidate_failed_only_by_simulation_stage_timeout(store: AlphaStore, candidate_id: int) -> bool:
+    errors = _simulation_errors(store, candidate_id)
+    if not errors:
+        return False
+    for error in errors:
+        if str(error.get("error") or "").strip() != "simulation_stage_timeout":
+            return False
+    return True
+
+
 def _generated_metadata(store: AlphaStore, candidate_id: int) -> Dict[str, Any]:
     for event in store.events_for_candidate(candidate_id):
         if event["event_type"] == "generated":
@@ -967,6 +1499,7 @@ def _history_memory(
     store: AlphaStore,
     target_settings: Dict[str, Any],
     known_fields: List[str],
+    field_catalog: Dict[str, Any] | None = None,
     submitted_avoidance: Dict[str, Any] | None = None,
     lit_tower_avoidance: Dict[str, Any] | None = None,
     created_since: str | None = None,
@@ -975,6 +1508,7 @@ def _history_memory(
     failure_reasons: Dict[str, int] = {}
     field_stats: Dict[str, Dict[str, Any]] = {}
     family_stats: Dict[str, Dict[str, Any]] = {}
+    dataset_stats: Dict[str, Dict[str, Any]] = {}
     structure_stats: Dict[str, Dict[str, Any]] = {}
     profile_outcomes: Dict[str, Dict[str, int]] = {}
     blocked_winner_archetypes: List[Dict[str, Any]] = []
@@ -995,22 +1529,28 @@ def _history_memory(
         if str(family).strip()
     }
 
-    candidates = (
-        list(reversed(store.list_candidates(created_since=created_since)))
-        if created_since
-        else store.list_recent_candidates(HISTORY_MEMORY_SCAN_LIMIT)
-    )
+    candidates = _history_memory_candidates(store, created_since=created_since)
+    field_metadata = _field_metadata_by_id(field_catalog)
+    archived_scanned = 0
     for candidate in candidates:
         settings = _loads_json(candidate.get("settings_json"))
         if not _candidate_scope_matches(settings, target_settings):
             continue
         scanned += 1
+        if candidate.get("archived"):
+            archived_scanned += 1
         status = str(candidate.get("status") or "unknown")
-        if streak_open and status == "failed":
+        candidate_id = int(candidate["id"])
+        memory_status = (
+            "simulation_timeout"
+            if status == "failed" and _candidate_failed_only_by_simulation_stage_timeout(store, candidate_id)
+            else status
+        )
+        if streak_open and memory_status == "failed":
             failure_streak += 1
-        elif status in {"approved", "submitted", "check_pending", "failed"}:
+        elif memory_status in {"approved", "submitted", "check_pending", "failed"}:
             streak_open = False
-        status_counts[status] = int(status_counts.get(status, 0)) + 1
+        status_counts[memory_status] = int(status_counts.get(memory_status) or 0) + 1
         metrics = _loads_json(candidate.get("metrics_json"))
         checks = _loads_json(candidate.get("checks_json"))
         quality = candidate_quality_summary(
@@ -1029,32 +1569,53 @@ def _history_memory(
         best_recent_quality_score = _max_number(best_recent_quality_score, quality.get("quality_score"))
         profile_bucket = profile_outcomes.setdefault(
             profile,
-            {"generated": 0, "approved": 0, "submitted": 0, "failed": 0, "check_pending": 0},
+            {"generated": 0, "approved": 0, "submitted": 0, "failed": 0, "check_pending": 0, "simulation_timeout": 0},
         )
         profile_bucket["generated"] += 1
-        if status in profile_bucket:
-            profile_bucket[status] += 1
+        if memory_status in profile_bucket:
+            profile_bucket[memory_status] += 1
 
-        if status == "failed":
-            for reason in _failure_reason_names(store, int(candidate["id"]), quality):
+        if memory_status == "failed":
+            for reason in _failure_reason_names(store, candidate_id, quality):
                 failure_reasons[reason] = int(failure_reasons.get(reason, 0)) + 1
 
-        for field in fields:
-            _update_memory_bucket(field_stats.setdefault(field, _new_memory_bucket(field)), status, metrics, quality)
-            family = _submission_field_family(field)
-            _update_memory_bucket(family_stats.setdefault(family, _new_memory_bucket(family)), status, metrics, quality)
-        _update_structure_bucket(
-            structure_stats.setdefault(structure_key, _new_structure_bucket(structure_key, expression)),
-            status,
-            metrics,
-            quality,
-        )
+        if memory_status != "simulation_timeout":
+            for field in fields:
+                _update_memory_bucket(field_stats.setdefault(field, _new_memory_bucket(field)), memory_status, metrics, quality)
+                family = _submission_field_family(field)
+                _update_memory_bucket(family_stats.setdefault(family, _new_memory_bucket(family)), memory_status, metrics, quality)
+                dataset = _history_field_dataset(field, field_metadata)
+                if dataset:
+                    bucket = dataset_stats.setdefault(dataset, _new_memory_bucket(dataset))
+                    _update_memory_bucket(
+                        bucket,
+                        memory_status,
+                        metrics,
+                        quality,
+                    )
+                    _add_distinct_bucket_value(bucket, "distinct_fields", field)
+            for dataset, probe_field in _candidate_probe_dataset_fields(store, candidate_id):
+                bucket = dataset_stats.setdefault(dataset, _new_memory_bucket(dataset))
+                _update_memory_bucket(
+                    bucket,
+                    memory_status,
+                    metrics,
+                    quality,
+                )
+                if probe_field:
+                    _add_distinct_bucket_value(bucket, "distinct_fields", probe_field)
+            _update_structure_bucket(
+                structure_stats.setdefault(structure_key, _new_structure_bucket(structure_key, expression)),
+                memory_status,
+                metrics,
+                quality,
+            )
 
         archetype = _blocked_winner_archetype(
             store,
             candidate,
             settings,
-            status,
+            memory_status,
             expression,
             fields,
             metrics if isinstance(metrics, dict) else {},
@@ -1074,10 +1635,14 @@ def _history_memory(
         "scan_limit": HISTORY_MEMORY_SCAN_LIMIT,
         "created_since": created_since,
         "scanned_candidates": scanned,
+        "archived_candidates_scanned": archived_scanned,
         "status_counts": status_counts,
         "top_fields": _top_memory_buckets(field_stats, 30),
+        "field_stats": _top_memory_buckets(field_stats, max(0, len(field_stats))),
+        "top_field_datasets": _dataset_memory_rows(_top_memory_buckets(dataset_stats, 30)),
         "top_field_families": _top_memory_buckets(family_stats, 20),
         "top_structures": _top_structure_buckets(structure_stats, 20),
+        "probe_exhausted_fields": _recent_probe_exhausted_fields(store, target_settings, known_fields),
         "top_failure_reasons": [
             {"reason": reason, "count": count}
             for reason, count in sorted(failure_reasons.items(), key=lambda item: (-item[1], item[0]))[:20]
@@ -1098,6 +1663,144 @@ def _history_memory(
         },
         "blocked_winner_archetypes": _top_blocked_winner_archetypes(blocked_winner_archetypes, MECHANISM_MEMORY_LIMIT),
     }
+
+
+def _history_memory_candidates(store: AlphaStore, created_since: str | None = None) -> List[Dict[str, Any]]:
+    active = (
+        list(reversed(store.list_candidates(created_since=created_since)))
+        if created_since
+        else store.list_recent_candidates(HISTORY_MEMORY_SCAN_LIMIT)
+    )
+    archived = store.list_recent_archived_candidates(
+        HISTORY_MEMORY_SCAN_LIMIT,
+        created_since=created_since,
+    )
+    combined: Dict[int, Dict[str, Any]] = {}
+    for candidate in [*archived, *active]:
+        try:
+            candidate_id = int(candidate.get("id") or candidate.get("original_candidate_id"))
+        except (TypeError, ValueError):
+            continue
+        combined[candidate_id] = candidate
+    return sorted(combined.values(), key=lambda item: int(item.get("id") or 0), reverse=True)[
+        :HISTORY_MEMORY_SCAN_LIMIT
+    ]
+
+
+def _recent_probe_exhausted_fields(
+    store: AlphaStore,
+    target_settings: Dict[str, Any],
+    known_fields: List[str],
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    known = {str(field).strip() for field in known_fields if str(field).strip()}
+    counts: Dict[str, Dict[str, Any]] = {}
+    exhausted_event_types = {"standardized_probe_exhausted", "production_rescue_probe_exhausted"}
+    for event in reversed(store.events_for_candidate(None)):
+        event_type = str(event["event_type"] or "")
+        if event_type not in exhausted_event_types:
+            continue
+        metadata = _loads_json(event.get("metadata_json"))
+        if not isinstance(metadata, dict):
+            continue
+        settings = metadata.get("settings")
+        if isinstance(settings, dict) and not _candidate_scope_matches(settings, target_settings):
+            continue
+        fields = metadata.get("probe_fields")
+        if not isinstance(fields, list):
+            continue
+        for item in fields:
+            field = str(item or "").strip()
+            if not field or (known and field not in known):
+                continue
+            bucket = counts.setdefault(
+                field,
+                {
+                    "field": field,
+                    "count": 0,
+                    "reason": str(metadata.get("reason") or event_type),
+                    "event_type": event_type,
+                    "last_seen_at": event.get("created_at"),
+                },
+            )
+            bucket["count"] = int(bucket.get("count") or 0) + 1
+            bucket["last_seen_at"] = event.get("created_at") or bucket.get("last_seen_at")
+        if len(counts) >= limit:
+            break
+    return sorted(counts.values(), key=lambda row: (-int(row.get("count") or 0), str(row.get("field") or "")))[:limit]
+
+
+def _field_metadata_by_id(field_catalog: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
+    fields = (field_catalog or {}).get("fields") if isinstance(field_catalog, dict) else []
+    if not isinstance(fields, list):
+        return {}
+    return {
+        str(field.get("id")): field
+        for field in fields
+        if isinstance(field, dict) and str(field.get("id") or "").strip()
+    }
+
+
+def _history_field_dataset(field: str, metadata: Dict[str, Dict[str, Any]]) -> str:
+    info = metadata.get(str(field)) if isinstance(metadata, dict) else {}
+    if isinstance(info, dict):
+        dataset = str(info.get("dataset_id") or info.get("datasetId") or "").strip().lower()
+        if dataset:
+            return dataset
+    text = str(field or "").strip().lower()
+    if text.startswith("snt23"):
+        return "sentiment23"
+    if text.startswith("anl10_"):
+        return "analyst10"
+    if text.startswith("anl4_"):
+        return "analyst4"
+    if text.startswith("nws3_"):
+        return "news3"
+    if text.startswith("fnd6_"):
+        return "fundamental6"
+    return ""
+
+
+def _candidate_probe_datasets(store: AlphaStore, candidate_id: int) -> List[str]:
+    return [dataset for dataset, _field in _candidate_probe_dataset_fields(store, candidate_id)]
+
+
+def _candidate_probe_dataset_fields(store: AlphaStore, candidate_id: int) -> List[tuple[str, str]]:
+    pairs: List[tuple[str, str]] = []
+    seen: set[str] = set()
+    for event in store.events_for_candidate(candidate_id):
+        event_type = str(event.get("event_type") or "")
+        if event_type not in {"generated", "probe_validation"}:
+            continue
+        metadata = _loads_json(event.get("metadata_json"))
+        if not isinstance(metadata, dict):
+            continue
+        candidates = [metadata]
+        ai_metadata = metadata.get("ai_metadata")
+        if isinstance(ai_metadata, dict):
+            candidates.append(ai_metadata)
+        for item in candidates:
+            dataset = str(item.get("probe_dataset_id") or "").strip().lower()
+            field = str(item.get("probe_field") or "").strip()
+            key = f"{dataset}\0{field}"
+            if dataset and key not in seen:
+                seen.add(key)
+                pairs.append((dataset, field))
+    return pairs
+
+
+def _dataset_memory_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        dataset = str(item.get("field") or item.get("name") or "").strip()
+        if dataset:
+            item["dataset_id"] = dataset
+        distinct_fields = item.get("distinct_fields")
+        if isinstance(distinct_fields, list):
+            item["distinct_field_count"] = len({str(field) for field in distinct_fields if str(field).strip()})
+        result.append(item)
+    return result
 
 
 def _blocked_winner_archetype(
@@ -1157,8 +1860,7 @@ def _blocked_winner_archetype(
         "forbidden_fields": forbidden_fields[:12],
         "mechanism_tags": _mechanism_tags(expression, fields),
         "transfer_hint": _mechanism_transfer_hint(expression, fields),
-        "policy": "Use as mechanism only. Do not copy this expression or its forbidden_fields.",
-        "expression": expression,
+        "policy": "Use as mechanism only. Do not reuse forbidden_fields as primary signals.",
     }
 
 
@@ -1300,6 +2002,18 @@ def _update_memory_bucket(
         _update_best_number(bucket, "best_sharpe", metrics.get("sharpe"))
         _update_best_number(bucket, "best_fitness", metrics.get("fitness"))
     _update_best_number(bucket, "best_quality_score", quality.get("quality_score"))
+
+
+def _add_distinct_bucket_value(bucket: Dict[str, Any], key: str, value: Any) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    values = bucket.get(key)
+    if not isinstance(values, list):
+        values = []
+        bucket[key] = values
+    if text not in values:
+        values.append(text)
 
 
 def _update_structure_bucket(
@@ -1571,25 +2285,14 @@ def _candidate_is_optimizable(item: Dict[str, Any]) -> bool:
     metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
     if "sharpe" not in metrics and "fitness" not in metrics:
         return False
-    failed = {_normalize_check_key(name) for name in item.get("failed_checks") or []}
-    hard_blockers = {
-        "highturnover",
-        "lowturnover",
-        "concentratedweight",
-        "prodcorrelation",
-        "productcorrelation",
-        "selfcorrelation",
-        "datadiversity",
-        "regularsubmission",
-        "d0submission",
+    candidate = dict(item)
+    candidate["quality_components"] = {
+        "failed_checks": item.get("failed_checks") or [],
+        "warning_checks": item.get("warning_checks") or [],
+        "pending_checks": item.get("pending_checks") or [],
+        "passed_checks": item.get("passed_checks") or [],
     }
-    if failed & hard_blockers:
-        return False
-    readiness = _number(item.get("readiness_score"))
-    quality = _number(item.get("quality_score"))
-    sharpe = _number(metrics.get("sharpe"))
-    fitness = _number(metrics.get("fitness"))
-    return readiness >= 0.45 or quality >= 0.0 or sharpe >= 1.0 or fitness >= 0.35
+    return bool(candidate_optimization_summary(candidate).get("eligible"))
 
 
 def _candidate_queue_sort_key(item: Dict[str, Any]) -> tuple[float, float, float, int]:
@@ -1624,13 +2327,6 @@ def _abandoned_candidate_ids(store: AlphaStore, target_settings: Dict[str, Any])
 
 def _normalize_check_key(value: Any) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
-
-
-def _number(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return -999.0
 
 
 def _candidate_feedback_reason(store: AlphaStore, candidate_id: int, feedback: Dict[str, Any]) -> str:

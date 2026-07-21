@@ -60,6 +60,21 @@ class FieldCatalogTests(unittest.TestCase):
         self.assertIn("vector_signal", catalog["vector_fields"])
         self.assertTrue(any("single-argument vec_* reducer" in rule for rule in catalog["rules"]))
 
+    def test_default_field_searches_cover_non_model_non_pv_towers_before_crowded_terms(self):
+        terms = _field_search_terms()
+
+        for required in ("option", "risk", "shortinterest", "macro", "earnings"):
+            self.assertIn(required, terms)
+        self.assertLess(terms.index("option"), terms.index("model"))
+        self.assertLess(terms.index("risk"), terms.index("pv"))
+        self.assertEqual(terms[-1], "")
+
+    def test_field_search_terms_preserves_explicit_blank_lookup_from_trailing_comma(self):
+        with patch.dict(os.environ, {"ALPHA_FIELD_SEARCHES": "option,risk,"}, clear=False):
+            terms = _field_search_terms()
+
+        self.assertEqual(terms, ["option", "risk", ""])
+
 
 if __name__ == "__main__":
     unittest.main()

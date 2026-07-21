@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .clients import BrainHTTPClient, LocalAIClient, LocalBrainClient, MultiModelAIClient, OpenAICompatibleAIClient
@@ -43,6 +45,32 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--run-minutes", type=float, default=None, help="运行指定分钟数后自动停止")
     daemon.add_argument("--scope-json", default=None, help="daemon 轮换探索的 scope JSON 列表")
     daemon.add_argument("--throughput-mode", action="store_true", help="使用 scheduler cycle_plan 提升个人研究吞吐")
+    daemon.add_argument(
+        "--generator-mode",
+        choices=("single", "balanced"),
+        default=None,
+        help="AI 生成模型分配：single=单模型省 token；balanced=双生成模型平分 batch",
+    )
+    daemon.add_argument(
+        "--orchestration-mode",
+        choices=("lean", "deep"),
+        default=None,
+        help="AI 编排模式：lean=省 token 直连生成；deep=启用 controller/critic 决策链",
+    )
+    daemon_auto_submit = daemon.add_mutually_exclusive_group()
+    daemon_auto_submit.add_argument(
+        "--auto-submit",
+        dest="auto_submit",
+        action="store_true",
+        default=None,
+        help="本轮 daemon 对达标 alpha 执行真实提交",
+    )
+    daemon_auto_submit.add_argument(
+        "--no-auto-submit",
+        dest="auto_submit",
+        action="store_false",
+        help="本轮 daemon 只审批达标 alpha，不执行真实提交",
+    )
     _add_scope_args(daemon)
 
     status = sub.add_parser("status", help="打印候选状态统计")
@@ -64,8 +92,10 @@ def _build_parser() -> argparse.ArgumentParser:
     plan_next.add_argument("--batch-size", type=int, default=None)
     _add_scope_args(plan_next)
     web = sub.add_parser("web", help="启动本地 Web 控制台")
-    web.add_argument("--host", default="0.0.0.0")
-    web.add_argument("--port", type=int, default=8080)
+    # Defaults are None so we can distinguish an explicit flag from "fall back to
+    # ALPHA_WEB_HOST/ALPHA_WEB_PORT env, then the safe loopback default".
+    web.add_argument("--host", default=None)
+    web.add_argument("--port", type=int, default=None)
     return parser
 
 
@@ -77,6 +107,49 @@ def _add_scope_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--neutralization", default=None)
     parser.add_argument("--decay", type=int, default=None)
     parser.add_argument("--truncation", type=float, default=None)
+
+
+def _apply_generator_mode_env(args: argparse.Namespace) -> None:
+    mode = str(getattr(args, "generator_mode", "") or "").strip().lower()
+    orchestration_mode = str(getattr(args, "orchestration_mode", "") or "").strip().lower()
+    if orchestration_mode:
+        os.environ["AI_ORCHESTRATION_MODE"] = orchestration_mode
+    elif mode:
+        os.environ["AI_ORCHESTRATION_MODE"] = "lean"
+    if not mode:
+        return
+    if mode == "balanced":
+        os.environ["AI_MAX_ACTIVE_GENERATORS"] = "0"
+        _ensure_min_float_env("AI_GENERATION_STAGE_TIMEOUT_SECONDS", 180.0)
+    elif mode == "single":
+        os.environ["AI_MAX_ACTIVE_GENERATORS"] = "1"
+
+
+def _apply_auto_submit_env(args: argparse.Namespace) -> None:
+    auto_submit = getattr(args, "auto_submit", None)
+    if auto_submit is None:
+        return
+    os.environ["AUTO_SUBMIT"] = "true" if bool(auto_submit) else "false"
+
+
+def _ensure_min_float_env(name: str, minimum: float) -> None:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw not in {None, ""} else 0.0
+    except (TypeError, ValueError):
+        value = 0.0
+    if value < minimum:
+        os.environ[name] = str(int(minimum) if float(minimum).is_integer() else minimum)
+
+
+def _int_env_cli(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
 
 
 def _simulation_context_from_args(base: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
@@ -131,6 +204,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     load_env_file(args.env_file, override=True)
+    _apply_generator_mode_env(args)
+    _apply_auto_submit_env(args)
     setup_logging(args.log_file)
     log = logging.getLogger("alpha.cli")
     cfg = load_config(db_path=args.db, batch_size=getattr(args, "batch_size", None))
@@ -157,6 +232,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_minutes = float(args.run_minutes or 0.0)
         deadline = time.monotonic() + run_minutes * 60.0 if run_minutes > 0 else None
         scope_rotation = parse_scope_json(cfg.simulation_context, args.scope_json)
+        _mark_daemon_started(
+            store,
+            args,
+            simulation_context,
+            batch_size=cfg.batch_size,
+            loop_seconds=loop_seconds,
+            run_minutes=run_minutes,
+            scope_rotation=scope_rotation,
+            argv=argv,
+        )
         try:
             while True:
                 if deadline is not None and time.monotonic() >= deadline:
@@ -167,29 +252,109 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cycle_context = next_rotating_scope(store, scope_rotation) if scope_rotation else simulation_context
                 cycle_plan = None
                 cycle_batch_size = cfg.batch_size
-                if getattr(args, "throughput_mode", False):
-                    cycle_plan = build_cycle_plan(store, cycle_context, batch_size=cfg.batch_size)
-                    cycle_context = dict(cycle_context)
-                    if isinstance(cycle_plan.get("scope"), dict):
-                        cycle_context.update(cycle_plan["scope"])
-                    budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+                try:
+                    if getattr(args, "throughput_mode", False):
+                        cycle_plan = build_cycle_plan(store, cycle_context, batch_size=cfg.batch_size)
+                        cycle_context = dict(cycle_context)
+                        if isinstance(cycle_plan.get("scope"), dict):
+                            cycle_context.update(cycle_plan["scope"])
+                        budget = cycle_plan.get("budget") if isinstance(cycle_plan.get("budget"), dict) else {}
+                        try:
+                            cycle_batch_size = int(budget.get("batch_size") or cfg.batch_size)
+                        except (TypeError, ValueError):
+                            cycle_batch_size = cfg.batch_size
+                        log.info("daemon_cycle_plan=%s", cycle_plan)
+                    log.info("daemon_cycle simulation_context=%s", cycle_context)
+                    worker = _worker(store, cycle_batch_size, cfg.policy, cfg.ai_client, cfg.brain_client, cycle_context)
+                    summary = worker.run_once(cycle_plan=cycle_plan) if cycle_plan is not None else worker.run_once()
+                    log.info("daemon_cycle summary=%s", summary)
+                    print(summary, flush=True)
+                except Exception as exc:
+                    # One failing cycle (transient BRAIN/AI/sqlite error) must not crash
+                    # the daemon; log, record, back off, and continue with the next cycle.
+                    log.exception("daemon cycle failed; backing off and continuing error=%s", exc)
                     try:
-                        cycle_batch_size = int(budget.get("batch_size") or cfg.batch_size)
-                    except (TypeError, ValueError):
-                        cycle_batch_size = cfg.batch_size
-                    log.info("daemon_cycle_plan=%s", cycle_plan)
-                log.info("daemon_cycle simulation_context=%s", cycle_context)
-                worker = _worker(store, cycle_batch_size, cfg.policy, cfg.ai_client, cfg.brain_client, cycle_context)
-                summary = worker.run_once(cycle_plan=cycle_plan) if cycle_plan is not None else worker.run_once()
-                log.info("daemon_cycle summary=%s", summary)
-                print(summary, flush=True)
+                        store.record_event(None, "daemon_cycle_error", {"error": str(exc)})
+                    except Exception:
+                        log.exception("failed to record daemon_cycle_error event")
+                    print("cycle_error", flush=True)
+                    backoff = loop_seconds
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            _mark_daemon_stopped(store, "time_limit")
+                            log.info("daemon time limit reached run_minutes=%s", run_minutes)
+                            print("time_limit_reached", flush=True)
+                            return 0
+                        backoff = min(backoff, remaining)
+                    time.sleep(backoff)
+                    continue
+                ai_timeout_backoff = bool(summary.get("ai_generation_timeout"))
+                ai_network_backoff = bool(summary.get("ai_network_blocked"))
                 if summary.get("ai_quota_blocked") or summary.get("ai_config_blocked"):
-                    reason = "ai_quota_blocked" if summary.get("ai_quota_blocked") else "ai_config_blocked"
+                    if summary.get("ai_quota_blocked"):
+                        reason = "ai_quota_blocked"
+                    else:
+                        reason = "ai_config_blocked"
                     _mark_daemon_stopped(store, reason)
                     log.warning("daemon stopped reason=%s", reason)
                     print(reason, flush=True)
                     return 0
-                sleep_seconds = loop_seconds
+                if ai_timeout_backoff:
+                    log.warning("daemon ai_generation_timeout summary=%s; backing off and continuing", summary)
+                    print("ai_generation_timeout_backoff", flush=True)
+                if ai_network_backoff:
+                    log.warning("daemon ai_network_blocked summary=%s; backing off and continuing", summary)
+                    print("ai_network_blocked_backoff", flush=True)
+                quality_exhausted_reason = _production_rescue_quality_exhausted_reason(summary, cycle_plan)
+                if quality_exhausted_reason:
+                    log.warning(
+                        "daemon route exhausted reason=%s summary=%s; continuing",
+                        quality_exhausted_reason,
+                        summary,
+                    )
+                    print(quality_exhausted_reason, flush=True)
+                quality_stop_reason = _production_rescue_quality_stop_reason(summary, cycle_plan)
+                if quality_stop_reason:
+                    _mark_daemon_stopped(store, quality_stop_reason)
+                    log.warning("daemon stopped reason=%s summary=%s", quality_stop_reason, summary)
+                    print(quality_stop_reason, flush=True)
+                    return 0
+                optimize_exhausted_reason = _optimize_quality_exhausted_reason(summary, cycle_plan)
+                if optimize_exhausted_reason:
+                    log.warning(
+                        "daemon route exhausted reason=%s summary=%s; continuing",
+                        optimize_exhausted_reason,
+                        summary,
+                    )
+                    print(optimize_exhausted_reason, flush=True)
+                probe_error_reason = _production_rescue_probe_error_stop_reason(summary, cycle_plan)
+                if probe_error_reason:
+                    log.warning(
+                        "daemon route exhausted reason=%s summary=%s; continuing",
+                        probe_error_reason,
+                        summary,
+                    )
+                    print(probe_error_reason, flush=True)
+                duplicate_only_reason = _production_rescue_duplicate_only_stop_reason(summary, cycle_plan)
+                if duplicate_only_reason:
+                    log.warning("daemon route exhausted reason=%s summary=%s; continuing", duplicate_only_reason, summary)
+                    print(duplicate_only_reason, flush=True)
+                explore_duplicate_only_reason = _explore_duplicate_only_stop_reason(summary, cycle_plan)
+                if explore_duplicate_only_reason:
+                    log.warning(
+                        "daemon route exhausted reason=%s summary=%s; continuing",
+                        explore_duplicate_only_reason,
+                        summary,
+                    )
+                    print(explore_duplicate_only_reason, flush=True)
+                if summary.get("quality_stop_loss"):
+                    log.warning("daemon quality_stop_loss summary=%s; continuing", summary)
+                sleep_seconds = (
+                    max(loop_seconds, _ai_generation_timeout_backoff_seconds())
+                    if (ai_timeout_backoff or ai_network_backoff)
+                    else loop_seconds
+                )
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -197,7 +362,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         log.info("daemon time limit reached run_minutes=%s", run_minutes)
                         print("time_limit_reached", flush=True)
                         return 0
-                    sleep_seconds = min(loop_seconds, remaining)
+                    sleep_seconds = min(sleep_seconds, remaining)
                 time.sleep(sleep_seconds)
         except KeyboardInterrupt:
             _mark_daemon_stopped(store, "interrupted")
@@ -296,12 +461,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "web":
         from .web import run_web_app
 
+        # Precedence: explicit --host/--port flag > ALPHA_WEB_HOST/PORT env > safe default.
+        host = args.host if args.host is not None else os.getenv("ALPHA_WEB_HOST", "127.0.0.1")
+        port = args.port if args.port is not None else _int_env_cli("ALPHA_WEB_PORT", 8080)
         return run_web_app(
             db_path=cfg.db_path,
             env_file=args.env_file,
             log_file=args.log_file,
-            host=args.host,
-            port=args.port,
+            host=host,
+            port=port,
         )
 
     if args.command == "submit-approved":
@@ -315,13 +483,163 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 2
 
 
+def _mark_daemon_started(
+    store: AlphaStore,
+    args: argparse.Namespace,
+    scope: Dict[str, Any],
+    *,
+    batch_size: int,
+    loop_seconds: float,
+    run_minutes: float,
+    scope_rotation: List[Dict[str, Any]],
+    argv: Optional[List[str]],
+) -> None:
+    started_at = utc_now()
+    state = {
+        "status": "running",
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "stopped_at": "",
+        "stop_reason": "",
+        "scope": {
+            "region": scope.get("region", "USA"),
+            "universe": scope.get("universe", "TOP3000"),
+            "delay": scope.get("delay", 1),
+            "neutralization": scope.get("neutralization", "INDUSTRY"),
+        },
+        "scope_rotation": scope_rotation,
+        "preset": str(getattr(args, "preset", None) or ""),
+        "generator_mode": str(getattr(args, "generator_mode", None) or ""),
+        "orchestration_mode": str(
+            getattr(args, "orchestration_mode", None) or os.environ.get("AI_ORCHESTRATION_MODE", "")
+        ),
+        "auto_submit": bool(os.environ.get("AUTO_SUBMIT", "").strip().lower() in {"1", "true", "yes", "on"}),
+        "throughput_mode": bool(getattr(args, "throughput_mode", False)),
+        "batch_size": int(batch_size),
+        "loop_seconds": float(loop_seconds),
+        "run_minutes": float(run_minutes),
+        "stop_after_at": _daemon_stop_after_at(started_at, run_minutes),
+        "argv": [sys.executable, "-m", "alpha.cli", *(list(argv) if argv is not None else sys.argv[1:])],
+    }
+    store.set_run_state("daemon", state)
+    store.record_event(None, "cli_daemon_started", state)
+
+
+def _daemon_stop_after_at(started_at: str, run_minutes: float) -> str:
+    if run_minutes <= 0:
+        return ""
+    try:
+        start = datetime.fromisoformat(started_at)
+    except ValueError:
+        start = datetime.now(timezone.utc).replace(microsecond=0)
+    return (start + timedelta(minutes=float(run_minutes))).replace(microsecond=0).isoformat()
+
+
 def _mark_daemon_stopped(store: AlphaStore, reason: str) -> None:
     state = store.get_run_state("daemon")
     pid = int(state.get("pid") or 0)
+    interrupted_preflight = store.fail_preflight_passed_candidates(
+        created_since=str(state.get("started_at") or "").strip() or None,
+        reason="interrupted_after_preflight",
+    )
     if pid in {0, os.getpid()}:
         state.update({"status": "stopped", "stopped_at": utc_now(), "stop_reason": reason})
         store.set_run_state("daemon", state)
-    store.record_event(None, "daemon_stopped", {"pid": os.getpid(), "reason": reason})
+    store.record_event(
+        None,
+        "daemon_stopped",
+        {"pid": os.getpid(), "reason": reason, "interrupted_preflight": interrupted_preflight},
+    )
+
+
+def _production_rescue_quality_stop_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if not summary.get("quality_stop_loss"):
+        return ""
+    if not isinstance(cycle_plan, dict):
+        return ""
+    return ""
+
+
+def _optimize_quality_exhausted_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if not summary.get("quality_stop_loss"):
+        return ""
+    if not isinstance(cycle_plan, dict):
+        return ""
+    if str(cycle_plan.get("mode") or "") != "optimize":
+        return ""
+    has_probe_signal = any(_summary_count(summary, key) > 0 for key in ("probe_watch", "probe_optimize_ready", "probe_sweep_ready"))
+    if has_probe_signal:
+        return ""
+    return "optimize_quality_stop_loss"
+
+
+def _production_rescue_quality_exhausted_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if not summary.get("quality_stop_loss"):
+        return ""
+    if not isinstance(cycle_plan, dict):
+        return ""
+    if str(cycle_plan.get("mode") or "") != "production_rescue":
+        return ""
+    has_probe_signal = any(_summary_count(summary, key) > 0 for key in ("probe_watch", "probe_optimize_ready", "probe_sweep_ready"))
+    if has_probe_signal:
+        return ""
+    return "production_rescue_quality_stop_loss"
+
+
+def _production_rescue_probe_error_stop_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if _summary_count(summary, "probe_simulation_error") <= 0:
+        return ""
+    if not isinstance(cycle_plan, dict):
+        return ""
+    if str(cycle_plan.get("mode") or "") != "production_rescue":
+        return ""
+    return "production_rescue_probe_simulation_error"
+
+
+def _production_rescue_duplicate_only_stop_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if not isinstance(cycle_plan, dict):
+        return ""
+    if str(cycle_plan.get("mode") or "") != "production_rescue":
+        return ""
+    if _summary_count(summary, "skipped") <= 0:
+        return ""
+    productive_keys = ("generated", "approved", "submitted", "failed", "pending")
+    if any(_summary_count(summary, key) > 0 for key in productive_keys):
+        return ""
+    return "production_rescue_duplicate_only"
+
+
+def _explore_duplicate_only_stop_reason(summary: Dict[str, Any], cycle_plan: Dict[str, Any] | None) -> str:
+    if not isinstance(cycle_plan, dict):
+        return ""
+    if str(cycle_plan.get("mode") or "") != "explore":
+        return ""
+    if _summary_count(summary, "standardized_probe_exhausted") > 0:
+        return ""
+    if _summary_count(summary, "production_rescue_probe_exhausted") > 0:
+        return ""
+    if _summary_count(summary, "field_scout_blocked") > 0:
+        return "field_scout_blocked"
+    if _summary_count(summary, "skipped") <= 0:
+        return ""
+    productive_keys = ("generated", "approved", "submitted", "failed", "pending")
+    if any(_summary_count(summary, key) > 0 for key in productive_keys):
+        return ""
+    return "explore_duplicate_only"
+
+
+def _summary_count(summary: Dict[str, Any], key: str) -> int:
+    try:
+        return int(summary.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ai_generation_timeout_backoff_seconds() -> float:
+    try:
+        return max(1.0, float(os.environ.get("AI_GENERATION_TIMEOUT_BACKOFF_SECONDS", "600")))
+    except (TypeError, ValueError):
+        return 600.0
 
 
 if __name__ == "__main__":
