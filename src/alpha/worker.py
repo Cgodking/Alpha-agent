@@ -252,6 +252,24 @@ class AlphaWorker:
             return summary
         self._record_cycle_stage("selecting_candidates", cycle_plan)
         candidates = self._planned_candidates(ai_context)
+        if (
+            candidates is not None
+            and all(_is_planner_probe_candidate(candidate) for candidate in candidates)
+            and _balanced_ai_generation_enabled(self.ai_client)
+        ):
+            self.store.record_event(
+                None,
+                "planned_probe_deferred_to_balanced_ai",
+                {
+                    "planned_probe_count": len(candidates),
+                    "requested_batch_size": int(self.batch_size or 0),
+                    "policy": (
+                        "Balanced multi-generator mode owns the full batch. Keep the probe plan as AI guidance "
+                        "instead of replacing the configured batch with a small deterministic probe batch."
+                    ),
+                },
+            )
+            candidates = None
         planned_duplicate_skips = int(getattr(self, "_planned_duplicate_skip_count", 0) or 0)
         if planned_duplicate_skips:
             summary["skipped"] += planned_duplicate_skips
@@ -1759,6 +1777,16 @@ def _is_unverified_production_probe(spec: CandidateSpec) -> bool:
 
 def _is_planner_probe_candidate(spec: CandidateSpec) -> bool:
     return str(spec.source or "") in {"planner_unverified_probe", "planner_standardized_probe"}
+
+
+def _balanced_ai_generation_enabled(ai_client: Any) -> bool:
+    enabled = getattr(ai_client, "balanced_generation_enabled", False)
+    if callable(enabled):
+        try:
+            enabled = enabled()
+        except Exception:
+            return False
+    return enabled is True
 
 
 def _planned_probe_ai_fill_size(

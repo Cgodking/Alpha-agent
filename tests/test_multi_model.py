@@ -850,6 +850,8 @@ class MultiModelTests(unittest.TestCase):
         glm = FakeGenerator("glm", "glm-4.5", role="optimizer")
         client = MultiModelAIClient(generators=[gemini, glm])
 
+        self.assertTrue(client.balanced_generation_enabled)
+
         client.generate_candidates(
             8,
             {
@@ -861,6 +863,87 @@ class MultiModelTests(unittest.TestCase):
 
         self.assertEqual(gemini.calls[0][0], 4)
         self.assertEqual(glm.calls[0][0], 4)
+
+    def test_multi_model_client_single_generator_mode_is_not_balanced(self):
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free")
+        glm = FakeGenerator("glm", "glm-4.5")
+        client = MultiModelAIClient(
+            generators=[gemini, glm],
+            orchestration_mode="lean",
+            max_active_generators=1,
+        )
+
+        self.assertFalse(client.balanced_generation_enabled)
+
+    def test_balanced_mode_does_not_drop_full_batch_when_production_probe_budget_is_two(self):
+        gemini = FakeGenerator("gemini", "gemini-3-flash-free")
+        glm = FakeGenerator("glm", "glm-4.5")
+        client = MultiModelAIClient(
+            generators=[gemini, glm],
+            orchestration_mode="lean",
+            max_active_generators=0,
+        )
+
+        candidates = client.generate_candidates(
+            8,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "explore_new_family",
+                        "production_rescue": {"active": True},
+                        "quality_budget": {"slots": {"probe_new_fields": 2}},
+                        "probe_recommendations": [{"field": "fresh_probe_field"}],
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(len(candidates), 8)
+        self.assertEqual([call[0] for call in gemini.calls], [4])
+        self.assertEqual([call[0] for call in glm.calls], [4])
+        self.assertEqual(client.last_plan["allocation"], {"gemini": 4, "glm": 4})
+
+    def test_balanced_lean_mode_assigns_distinct_structure_and_field_lanes(self):
+        gemini = FakeGenerator("G-1", "DeepSeek-V4-Pro")
+        glm = FakeGenerator("G-2", "DeepSeek-V4-Pro")
+        client = MultiModelAIClient(
+            generators=[gemini, glm],
+            orchestration_mode="lean",
+            max_active_generators=0,
+        )
+
+        client.generate_candidates(
+            8,
+            {
+                "region": "USA",
+                "delay": 0,
+                "research_context": {
+                    "experiment_plan": {
+                        "mode": "explore_new_family",
+                        "probe_recommendations": [
+                            {"field": f"fresh_field_{index}"}
+                            for index in range(8)
+                        ],
+                    }
+                },
+            },
+        )
+
+        first_context = gemini.calls[0][1]["research_context"]
+        second_context = glm.calls[0][1]["research_context"]
+        first_guidance = first_context["profile_guidance"]
+        second_guidance = second_context["profile_guidance"]
+        self.assertNotEqual(first_guidance["mechanism"], second_guidance["mechanism"])
+        self.assertEqual(
+            first_guidance["assigned_primary_fields"],
+            ["fresh_field_0", "fresh_field_2", "fresh_field_4", "fresh_field_6"],
+        )
+        self.assertEqual(
+            second_guidance["assigned_primary_fields"],
+            ["fresh_field_1", "fresh_field_3", "fresh_field_5", "fresh_field_7"],
+        )
 
     def test_multi_model_client_refills_balanced_lean_batch_after_filtering(self):
         gemini = DuplicateThenUniqueGenerator("gemini", "gemini-3-flash-free")

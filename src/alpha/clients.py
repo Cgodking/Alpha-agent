@@ -1217,12 +1217,18 @@ class MultiModelAIClient:
             targeted_repair_generators=_int_env("AI_TARGETED_REPAIR_GENERATORS", 2),
         )
 
+    @property
+    def balanced_generation_enabled(self) -> bool:
+        return self.max_active_generators == 0 and len(self.generators) > 1
+
     def generate_candidates(self, batch_size: int, context: Dict[str, Any]) -> List[CandidateSpec]:
         self.last_errors = []
         self.last_validator_rejections = []
         self.last_partial_candidates = []
         if not self.generators:
             raise AIClientError("AI_CLIENT=multi requires at least one generator or optimizer profile")
+        if self.balanced_generation_enabled:
+            context = {**dict(context or {}), "_balanced_full_batch_generation": True}
         allocation = self._allocation(batch_size, context)
         candidates = self._generate_allocated_candidates(allocation, context)
         candidates = self._tag_orchestration_metadata(candidates, allocation)
@@ -1522,10 +1528,11 @@ class MultiModelAIClient:
         generator_profiles = [_client_profile_dict(generator) for generator in self.generators]
         if self._lean_orchestration_enabled(context):
             allocation = self._fallback_allocation(batch_size, context)
+            profile_guidance = self._lean_balanced_profile_guidance(context, allocation)
             self.last_plan = {
                 "controller": "lean",
                 "allocation": allocation,
-                "profile_guidance": {},
+                "profile_guidance": profile_guidance,
                 "orchestration_mode": self.orchestration_mode,
             }
             experiment_plan = _experiment_plan_from_context(context)
@@ -1587,6 +1594,61 @@ class MultiModelAIClient:
         if experiment_plan:
             self.last_plan["experiment_plan"] = experiment_plan
         return allocation
+
+    def _lean_balanced_profile_guidance(
+        self,
+        context: Dict[str, Any],
+        allocation: Dict[str, int],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not self.balanced_generation_enabled or len(allocation) < 2:
+            return {}
+        plan = _experiment_plan_from_context(context)
+        if _targeted_experiment_mode(str(plan.get("mode") or "")):
+            return {}
+
+        fields = _balanced_guidance_fields(plan)
+        lanes = (
+            {
+                "objective": (
+                    "Build cross-sectional persistence signals. Every candidate must use a different operator geometry, "
+                    "not merely another field or window in the same template."
+                ),
+                "mechanism": "persistent level, scale-aware normalization, and group-relative robustness",
+                "structure": (
+                    "Use four distinct shapes selected from group_zscore(ts_zscore(...)), group_rank(ts_rank(...)), "
+                    "rank(ts_av_diff(...)), and a normalized multi-horizon additive blend."
+                ),
+            },
+            {
+                "objective": (
+                    "Build change, reversal, and confirmation signals. Every candidate must use a different operator "
+                    "geometry and must not mirror the persistence lane."
+                ),
+                "mechanism": "temporal change, smooth reversal, cross-field confirmation, and conditional scaling",
+                "structure": (
+                    "Use four distinct shapes selected from rank(ts_delta(...)), rank(ts_decay_linear(...)), "
+                    "group_rank(ts_zscore(...)), and a multiplicative or additive confirmation blend."
+                ),
+            },
+        )
+        names = list(allocation)
+        guidance: Dict[str, Dict[str, Any]] = {}
+        for index, name in enumerate(names):
+            assigned_fields = fields[index:: len(names)]
+            lane = dict(lanes[index % len(lanes)])
+            if assigned_fields:
+                lane["assigned_primary_fields"] = assigned_fields[:12]
+                lane["objective"] = (
+                    f"{lane['objective']} Use assigned_primary_fields as the primary field pool and do not copy the "
+                    "other profile's field route."
+                )
+            lane["avoid"] = [
+                "same formula skeleton with only field substitutions",
+                "same formula skeleton with only window substitutions",
+                "overused structures listed in structure_diversity_control",
+            ]
+            guidance[name] = lane
+        return guidance
 
     def _lean_orchestration_enabled(self, context: Dict[str, Any] | None = None) -> bool:
         return self.orchestration_mode == "lean"
@@ -2488,7 +2550,7 @@ def _quality_budget_select(
             if quota <= 0:
                 break
 
-    if _production_rescue_budget_active(plan):
+    if _production_rescue_budget_active(plan) and not context.get("_balanced_full_batch_generation"):
         return selected
 
     for index, candidate in enumerate(candidates):
@@ -2558,6 +2620,20 @@ def _probe_recommendation_fields(plan: Dict[str, Any]) -> List[str]:
         if isinstance(recommendation, dict) and str(recommendation.get("field") or "").strip():
             fields.append(str(recommendation["field"]))
     return fields
+
+
+def _balanced_guidance_fields(plan: Dict[str, Any]) -> List[str]:
+    fields = _probe_recommendation_fields(plan)
+    field_scout = plan.get("field_scout") if isinstance(plan.get("field_scout"), dict) else {}
+    for key in ("top_primary_fields", "top_fields"):
+        rows = field_scout.get(key) if isinstance(field_scout, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            field = str(row.get("field") or row.get("id") or "").strip() if isinstance(row, dict) else ""
+            if field:
+                fields.append(field)
+    return list(dict.fromkeys(fields))
 
 
 def _expression_uses_any_field(expression: str, fields: Any) -> bool:

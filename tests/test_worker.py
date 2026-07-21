@@ -398,6 +398,86 @@ class WorkerTests(unittest.TestCase):
             ]
             self.assertEqual([event["stage"] for event in probe_events], ["reject", "optimize_ready"])
 
+    def test_worker_balanced_mode_uses_full_ai_batch_instead_of_small_production_probe_batch(self):
+        class BalancedAI:
+            balanced_generation_enabled = True
+
+            def __init__(self):
+                self.batch_sizes = []
+                self.last_plan = {}
+
+            def generate_candidates(self, batch_size, context):
+                self.batch_sizes.append(batch_size)
+                self.last_plan = {"allocation": {"G-1": 4, "G-2": 4}}
+                return [
+                    CandidateSpec(
+                        f"group_rank(ts_rank(mdl_mock_score,{22 + index}),industry)",
+                        source=f"model:G-{1 + index % 2}",
+                    )
+                    for index in range(batch_size)
+                ]
+
+        ai_context = {
+            "region": "USA",
+            "universe": "TOP500",
+            "delay": 0,
+            "research_context": {
+                "datafields": {
+                    "field_ids": ["mdl_mock_score"],
+                    "field_types": {"mdl_mock_score": "MATRIX"},
+                },
+                "experiment_plan": {
+                    "mode": "explore_new_family",
+                    "production_rescue": {"active": True},
+                    "quality_budget": {"slots": {"probe_new_fields": 2}},
+                    "probe_recommendations": [
+                        {
+                            "field": "mdl_mock_score",
+                            "dataset_id": "model16",
+                            "category": "Model",
+                            "route": "production_rescue_probe",
+                            "templates": [
+                                "rank(ts_mean(mdl_mock_score,20))",
+                                "rank(ts_rank(mdl_mock_score,60))",
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlphaStore(Path(tmp) / "alpha.db")
+            store.init()
+            ai = BalancedAI()
+            worker = AlphaWorker(
+                store=store,
+                ai_client=ai,
+                brain_client=LocalBrainClient(),
+                policy=SubmissionPolicy(auto_submit=False),
+                batch_size=8,
+                context={"region": "USA", "universe": "TOP500", "delay": 0, "neutralization": "INDUSTRY"},
+            )
+            worker._build_cycle_ai_context = lambda cycle_plan=None: ai_context
+
+            summary = worker.run_once()
+
+            rows = store.list_candidates()
+            self.assertEqual(ai.batch_sizes, [8])
+            self.assertEqual(summary["generated"], 8)
+            self.assertEqual(len(rows), 8)
+            self.assertTrue(all(row["source"].startswith("model:G-") for row in rows))
+            global_events = store.events_for_candidate(None)
+            self.assertTrue(
+                any(event["event_type"] == "planned_probe_deferred_to_balanced_ai" for event in global_events)
+            )
+            allocations = [
+                json.loads(event["metadata_json"])
+                for event in global_events
+                if event["event_type"] == "model_allocation"
+            ]
+            self.assertEqual(allocations[-1]["allocation"], {"G-1": 4, "G-2": 4})
+
     def test_worker_mixes_standardized_probes_with_ai_when_broad_exploration_has_budget(self):
         class MixedAI:
             def __init__(self):
